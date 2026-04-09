@@ -70,9 +70,9 @@ main(int argc, char **argv)
 	buf_nbytes = xnvme_dev_get_geo(dev)->nbytes;
 
 	xnvme_cli_pinf("Allocate a payload-buffer of nbytes: %zu", buf_nbytes);
-	buf = xnvme_buf_alloc(dev, buf_nbytes);
+	buf = xnvme_queue_buf_alloc(queue, buf_nbytes);
 	if (!buf) {
-		xnvme_cli_perr("xnvme_buf_alloc()", errno);
+		xnvme_cli_perr("xnvme_queue_buf_alloc()", errno);
 		goto exit;
 	}
 
@@ -116,7 +116,7 @@ submit:
 	}
 
 exit:
-	xnvme_buf_free(dev, buf);
+	xnvme_queue_buf_free(queue, buf);
 	xnvme_queue_term(queue);
 	xnvme_dev_close(dev);
 

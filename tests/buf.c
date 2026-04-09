@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <errno.h>
+#include <string.h>
 #include <libxnvme.h>
 
 static int
@@ -123,6 +124,65 @@ test_virt_buf_alloc_free(struct xnvme_cli *cli)
 	return nerr ? -ENOMEM : 0;
 }
 
+static int
+test_queue_buf_alloc_free(struct xnvme_cli *cli)
+{
+	struct xnvme_dev *dev = cli->args.dev;
+	const struct xnvme_opts *dev_opts = xnvme_dev_get_opts(dev);
+	struct xnvme_queue_attr attr = {
+		.opts = 0,
+		.mem = dev_opts->mem,
+	};
+	struct xnvme_queue *queue_default = NULL;
+	struct xnvme_queue *queue = NULL;
+	uint64_t count = cli->args.count;
+	int err = 0;
+	int nerr = 0;
+
+	err = xnvme_queue_init(dev, 2, 0, &queue_default);
+	if (err) {
+		xnvme_cli_perr("xnvme_queue_init()", err);
+		return err;
+	}
+
+	err = xnvme_queue_init_with_attr(dev, 2, &attr, &queue);
+	if (err) {
+		xnvme_cli_perr("xnvme_queue_init_with_attr()", err);
+		xnvme_queue_term(queue_default);
+		return err;
+	}
+
+	if (!xnvme_queue_get_mem_id(queue) || !xnvme_queue_get_mem_id(queue_default) ||
+	    strcmp(xnvme_queue_get_mem_id(queue), xnvme_queue_get_mem_id(queue_default))) {
+		xnvme_cli_pinf("unexpected mem queue policy");
+		err = -EIO;
+		goto exit;
+	}
+
+	for (uint64_t i = 0; i < count; ++i) {
+		size_t buf_nbytes = 1 << i;
+		void *buf;
+
+		printf("\n");
+		xnvme_cli_pinf("[queue alloc/free] i: %zu, buf_nbytes: %zu", i + 1, buf_nbytes);
+
+		buf = xnvme_queue_buf_alloc(queue, buf_nbytes);
+		if (!buf) {
+			xnvme_cli_perr("xnvme_queue_buf_alloc()", -errno);
+			nerr += 1;
+			continue;
+		}
+		xnvme_queue_buf_free(queue, buf);
+	}
+
+	err = nerr ? -ENOMEM : 0;
+
+exit:
+	xnvme_queue_term(queue);
+	xnvme_queue_term(queue_default);
+	return err;
+}
+
 //
 // Command-Line Interface (CLI) definition
 //
@@ -169,6 +229,21 @@ static struct xnvme_cli_sub g_subs[] = {
 			{XNVME_CLI_OPT_COUNT, XNVME_CLI_LREQ},
 
 			XNVME_CLI_ADMIN_OPTS,
+		},
+	},
+	{
+		"queue_buf_alloc_free",
+		"Allocate and free a queue-scoped buffer 'count' times of size [1, 2^count]",
+		"Allocate and free a queue-scoped buffer 'count' times of size [1, 2^count]",
+		test_queue_buf_alloc_free,
+		{
+			{XNVME_CLI_OPT_POSA_TITLE, XNVME_CLI_SKIP},
+			{XNVME_CLI_OPT_URI, XNVME_CLI_POSA},
+
+			{XNVME_CLI_OPT_NON_POSA_TITLE, XNVME_CLI_SKIP},
+			{XNVME_CLI_OPT_COUNT, XNVME_CLI_LREQ},
+
+			XNVME_CLI_ASYNC_OPTS,
 		},
 	},
 };

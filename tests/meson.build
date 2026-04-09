@@ -12,10 +12,13 @@ tests = {
     ['count=8', ['init_term', '1GB', '--count', '8', '--qdepth', '64']],
     ['count=16', ['init_term', '1GB', '--count', '16', '--qdepth', '64']],
     ['count=32', ['init_term', '1GB', '--count', '32', '--qdepth', '64']],
+    ['init_term_ex', ['init_term_ex', '1GB', '--qdepth', '64']],
+    ['init_term_ex_invalid', ['init_term_ex_invalid', '1GB', '--qdepth', '64']],
   ],
   'buf.c': [
     ['alloc', ['buf_alloc_free', '1GB', '--count', '31']],
     ['virt_alloc', ['buf_virt_alloc_free', '1GB', '--count', '31']],
+    ['queue_alloc', ['queue_buf_alloc_free', '1GB', '--count', '31']],
   ],
   'cli.c': [
     ['optional', ['optional']],

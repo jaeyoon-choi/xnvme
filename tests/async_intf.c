@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <errno.h>
+#include <string.h>
 #include <libxnvme.h>
 
 #define XNVME_TESTS_QDEPTH_MAX 512
@@ -94,6 +95,85 @@ exit:
 	return err;
 }
 
+static int
+test_init_term_ex(struct xnvme_cli *cli)
+{
+	struct xnvme_dev *dev = cli->args.dev;
+	const struct xnvme_opts *dev_opts = xnvme_dev_get_opts(dev);
+	struct xnvme_queue_attr fallback_attr = {
+		.opts = 0,
+	};
+	struct xnvme_queue_attr attr = {
+		.opts = 0,
+		.mem = dev_opts->mem,
+	};
+	struct xnvme_queue *queue_default = NULL;
+	struct xnvme_queue *queue_fallback = NULL;
+	struct xnvme_queue *queue = NULL;
+	int err;
+
+	err = xnvme_queue_init(dev, cli->args.qdepth, 0, &queue_default);
+	if (err) {
+		xnvme_cli_perr("xnvme_queue_init()", err);
+		return err;
+	}
+
+	err = xnvme_queue_init_with_attr(dev, cli->args.qdepth, &attr, &queue);
+	if (err) {
+		xnvme_cli_perr("xnvme_queue_init_with_attr()", err);
+		xnvme_queue_term(queue_default);
+		return err;
+	}
+
+	if (!xnvme_queue_get_mem_id(queue) ||
+	    strcmp(xnvme_queue_get_mem_id(queue), xnvme_queue_get_mem_id(queue_default))) {
+		xnvme_cli_pinf("unexpected mem queue policy");
+		err = -EIO;
+		goto exit;
+	}
+
+	err = xnvme_queue_init_with_attr(dev, cli->args.qdepth, &fallback_attr, &queue_fallback);
+	if (err) {
+		xnvme_cli_perr("xnvme_queue_init_with_attr(fallback)", err);
+		goto exit;
+	}
+
+	if (!xnvme_queue_get_mem_id(queue_fallback) ||
+	    strcmp(xnvme_queue_get_mem_id(queue_fallback), xnvme_queue_get_mem_id(queue_default))) {
+		xnvme_cli_pinf("unexpected mem fallback policy");
+		err = -EIO;
+		goto exit;
+	}
+
+	err = 0;
+
+exit:
+	xnvme_queue_term(queue_fallback);
+	xnvme_queue_term(queue);
+	xnvme_queue_term(queue_default);
+	return err;
+}
+
+static int
+test_init_term_ex_invalid(struct xnvme_cli *cli)
+{
+	struct xnvme_dev *dev = cli->args.dev;
+	struct xnvme_queue *queue = NULL;
+	struct xnvme_queue_attr attr = {
+		.opts = 0,
+		.mem = "__xnvme_no_such_mem__",
+	};
+	int err;
+
+	err = xnvme_queue_init_with_attr(dev, cli->args.qdepth, &attr, &queue);
+	if (err != -ENOSYS) {
+		xnvme_cli_pinf("unexpected result for invalid mem override: %d", err);
+		return -EIO;
+	}
+
+	return 0;
+}
+
 //
 // Command-Line Interface (CLI) definition
 //
@@ -111,6 +191,36 @@ static struct xnvme_cli_sub g_subs[] = {
 			{XNVME_CLI_OPT_COUNT, XNVME_CLI_LREQ},
 			{XNVME_CLI_OPT_QDEPTH, XNVME_CLI_LREQ},
 			{XNVME_CLI_OPT_CLEAR, XNVME_CLI_LFLG},
+
+			XNVME_CLI_ASYNC_OPTS,
+		},
+	},
+	{
+		"init_term_ex",
+		"Create a queue with explicit queue memory policy",
+		"Create a queue with explicit queue memory policy",
+		test_init_term_ex,
+		{
+			{XNVME_CLI_OPT_POSA_TITLE, XNVME_CLI_SKIP},
+			{XNVME_CLI_OPT_URI, XNVME_CLI_POSA},
+
+			{XNVME_CLI_OPT_NON_POSA_TITLE, XNVME_CLI_SKIP},
+			{XNVME_CLI_OPT_QDEPTH, XNVME_CLI_LREQ},
+
+			XNVME_CLI_ASYNC_OPTS,
+		},
+	},
+	{
+		"init_term_ex_invalid",
+		"Reject invalid queue memory overrides",
+		"Reject invalid queue memory overrides",
+		test_init_term_ex_invalid,
+		{
+			{XNVME_CLI_OPT_POSA_TITLE, XNVME_CLI_SKIP},
+			{XNVME_CLI_OPT_URI, XNVME_CLI_POSA},
+
+			{XNVME_CLI_OPT_NON_POSA_TITLE, XNVME_CLI_SKIP},
+			{XNVME_CLI_OPT_QDEPTH, XNVME_CLI_LREQ},
 
 			XNVME_CLI_ASYNC_OPTS,
 		},
