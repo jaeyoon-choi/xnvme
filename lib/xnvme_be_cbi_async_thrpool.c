@@ -51,7 +51,7 @@ struct xnvme_queue_thrpool {
 	int nthreads;
 	pthread_t *threads;
 
-	uint8_t _rsvd[204];
+	uint8_t _rsvd[196];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_thrpool) == XNVME_BE_QUEUE_STATE_NBYTES,
 		    "Incorrect size")

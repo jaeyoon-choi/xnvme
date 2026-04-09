@@ -37,13 +37,14 @@ struct xnvme_queue_base {
 	uint32_t capacity;     ///< Maximum number of outstanding commands
 	uint32_t outstanding;  ///< Number of currently outstanding commands
 	SLIST_HEAD(, xnvme_cmd_ctx_entry) pool;
+	const struct xnvme_be_mem *mem; ///< Queue memory backend, defaults to dev->be.mem
 };
-XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_base) == 24, "Incorrect size")
+XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_base) == 32, "Incorrect size")
 
 struct xnvme_queue {
 	struct xnvme_queue_base base;
 
-	uint8_t be_rsvd[232]; ///< Auxilary backend data
+	uint8_t be_rsvd[224]; ///< Auxilary backend data
 
 	struct xnvme_cmd_ctx_entry pool_storage[];
 };

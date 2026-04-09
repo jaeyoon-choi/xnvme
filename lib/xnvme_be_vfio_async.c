@@ -18,7 +18,7 @@ struct xnvme_queue_vfio {
 	struct nvme_cq *cq;
 	uint id;
 
-	uint8_t _rsvd[208];
+	uint8_t _rsvd[200];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_vfio) == XNVME_BE_QUEUE_STATE_NBYTES,
 		    "Incorrect size")

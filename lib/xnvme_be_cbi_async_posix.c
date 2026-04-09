@@ -22,7 +22,7 @@ struct posix_queue {
 	TAILQ_HEAD(, posix_request) reqs_outstanding;
 	struct posix_request *reqs_storage;
 
-	uint8_t rsvd[188];
+	uint8_t rsvd[180];
 };
 XNVME_STATIC_ASSERT(sizeof(struct posix_queue) == XNVME_BE_QUEUE_STATE_NBYTES, "Incorrect size")
 

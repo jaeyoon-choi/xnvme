@@ -18,8 +18,6 @@ struct xnvme_queue_liburing {
 	uint8_t poll_sq;
 	uint8_t batching;
 	int efd; // Completion event FD
-
-	uint8_t _rsvd[5];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_liburing) == XNVME_BE_QUEUE_STATE_NBYTES,
 		    "Incorrect size")

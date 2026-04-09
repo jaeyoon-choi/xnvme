@@ -18,7 +18,7 @@ struct xnvme_queue_ioring {
 
 	HINSTANCE lib_module;
 
-	uint8_t _rsvd[216];
+	uint8_t _rsvd[208];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_ioring) == XNVME_BE_QUEUE_STATE_NBYTES,
 		    "Incorrect size")

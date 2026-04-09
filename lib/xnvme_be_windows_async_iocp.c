@@ -26,7 +26,7 @@ struct xnvme_queue_aio_ov {
 	HANDLE iocp_handle;
 	TAILQ_HEAD(, _ov_request) reqs_ready;
 	struct _ov_request *rp;
-	uint8_t rsvd[198];
+	uint8_t rsvd[190];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_aio_ov) == XNVME_BE_QUEUE_STATE_NBYTES,
 		    "Incorrect size")

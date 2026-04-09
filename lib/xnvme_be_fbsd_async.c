@@ -31,7 +31,7 @@ struct xnvme_queue_kqueue {
 
 	uint8_t poll_io;
 
-	uint8_t rsvd[175];
+	uint8_t rsvd[167];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_kqueue) == XNVME_BE_QUEUE_STATE_NBYTES,
 		    "Incorrect size")

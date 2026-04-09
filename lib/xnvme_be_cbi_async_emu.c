@@ -42,7 +42,7 @@ struct xnvme_queue_emu {
 
 	struct qpair *qp;
 
-	uint8_t _rsvd[224];
+	uint8_t _rsvd[216];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_emu) == XNVME_BE_QUEUE_STATE_NBYTES,
 		    "Incorrect size")

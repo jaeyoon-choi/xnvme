@@ -28,7 +28,7 @@ struct xnvme_queue_spdk {
 
 	struct xnvme_be_spdk_iov_payload *iov_payloads;
 
-	uint8_t rsvd[216];
+	uint8_t rsvd[208];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue_spdk) == XNVME_BE_QUEUE_STATE_NBYTES,
 		    "Incorrect size")

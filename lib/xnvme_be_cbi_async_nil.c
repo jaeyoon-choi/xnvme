@@ -12,7 +12,7 @@
 #include <xnvme_queue.h>
 #include <xnvme_dev.h>
 
-#define XNVME_BE_CBI_ASYNC_NIL_CTX_DEPTH_MAX 29
+#define XNVME_BE_CBI_ASYNC_NIL_CTX_DEPTH_MAX 28
 
 struct nil_queue {
 	struct xnvme_queue_base base;
