@@ -6,6 +6,8 @@
 #define __INTERNAL_XNVME_QUEUE_H
 #include <sys/queue.h>
 
+struct xnvme_be_mem;
+
 /**
  * Internal command-context representation, the difference between this and the 'struct
  * xnvme_cmd_ctx' in the public API, are that the last eight bytes of 'struct xnvme_cmd_ctx_entry'
@@ -49,5 +51,8 @@ struct xnvme_queue {
 	struct xnvme_cmd_ctx_entry pool_storage[];
 };
 XNVME_STATIC_ASSERT(sizeof(struct xnvme_queue) == XNVME_BE_QUEUE_STATE_NBYTES, "Incorrect size")
+
+const struct xnvme_be_mem *
+xnvme_queue_get_mem_ops(const struct xnvme_queue *queue);
 
 #endif /* __INTERNAL_XNVME_QUEUE_H */

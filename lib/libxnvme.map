@@ -194,8 +194,10 @@
 
 		# libxnvme_queue.h
 		xnvme_queue;
+		xnvme_queue_attr;
 		xnvme_queue_opts;
 		xnvme_queue_init;
+		xnvme_queue_init_with_attr;
 		xnvme_queue_get_capacity;
 		xnvme_queue_get_outstanding;
 		xnvme_queue_term;
@@ -207,6 +209,14 @@
 		xnvme_queue_cb;
 		xnvme_queue_set_cb;
 		xnvme_queue_get_completion_fd;
+		xnvme_queue_get_mem_id;
+		xnvme_queue_buf_alloc;
+		xnvme_queue_buf_realloc;
+		xnvme_queue_buf_free;
+		xnvme_queue_buf_phys_alloc;
+		xnvme_queue_buf_phys_realloc;
+		xnvme_queue_buf_phys_free;
+		xnvme_queue_buf_vtophys;
 
 		# libxnvme_cuda.h
 		xnvme_cuda_queue_create;

@@ -6,6 +6,47 @@
 #include <xnvme_be.h>
 #include <xnvme_platform.h>
 
+const struct xnvme_be_config *
+xnvme_be_config_from_be(const struct xnvme_be *be)
+{
+	if (!be || !be->attr.name) {
+		return NULL;
+	}
+
+	for (int i = 0; g_xnvme_platform->backends[i]; ++i) {
+		const struct xnvme_be_config *cfg = g_xnvme_platform->backends[i];
+
+		if (cfg->attr.name && !strcmp(be->attr.name, cfg->attr.name)) {
+			return cfg;
+		}
+	}
+
+	return NULL;
+}
+
+const struct xnvme_be_mem *
+xnvme_be_config_get_mem(const struct xnvme_be_config *cfg, const char *name)
+{
+	if (!cfg || !name) {
+		return NULL;
+	}
+	if (cfg->mem && cfg->mem->id && !strcmp(name, cfg->mem->id)) {
+		return cfg->mem;
+	}
+
+	if (cfg->mem_overrides) {
+		for (int i = 0; cfg->mem_overrides[i]; ++i) {
+			const struct xnvme_be_mem *mem = cfg->mem_overrides[i];
+
+			if (mem->id && !strcmp(name, mem->id)) {
+				return mem;
+			}
+		}
+	}
+
+	return NULL;
+}
+
 int
 xnvme_be_yaml(FILE *stream, const struct xnvme_be *be, int indent, const char *sep, int head)
 {

@@ -220,6 +220,18 @@ xnvme_be_id2name(int bid);
 int
 xnvme_be_name2id(const char *bname);
 
+/**
+ * Resolve the backend config used to instantiate the given backend.
+ */
+const struct xnvme_be_config *
+xnvme_be_config_from_be(const struct xnvme_be *be);
+
+/**
+ * Resolve a memory backend by id from a backend config default and overrides.
+ */
+const struct xnvme_be_mem *
+xnvme_be_config_get_mem(const struct xnvme_be_config *cfg, const char *name);
+
 int
 xnvme_be_yaml(FILE *stream, const struct xnvme_be *be, int indent, const char *sep, int head);
 

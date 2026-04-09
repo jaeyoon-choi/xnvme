@@ -10,6 +10,49 @@
 #include <xnvme_dev.h>
 #include <xnvme_queue.h>
 
+static int
+queue_bind_mem_policy(struct xnvme_queue *queue, const struct xnvme_queue_attr *attr)
+{
+	const struct xnvme_be_config *cfg = NULL;
+	const struct xnvme_be_mem *mem = NULL;
+	const char *mem_name = NULL;
+
+	/*
+	 * Queue memory policy falls back in two steps:
+	 *
+	 * 1) explicit queue attributes
+	 * 2) the currently bound device memory backend id
+	 *
+	 * This keeps queue-init consistent with device defaults while still
+	 * allowing per-queue memory overrides.
+	 */
+	mem_name = attr ? attr->mem : NULL;
+	if (!mem_name || !strcmp(mem_name, queue->base.dev->be.mem.id)) {
+		queue->base.mem = &queue->base.dev->be.mem;
+		return 0;
+	}
+
+	cfg = xnvme_be_config_from_be(&queue->base.dev->be);
+	mem = xnvme_be_config_get_mem(cfg, mem_name);
+	if (!mem) {
+		XNVME_DEBUG("FAILED: no mem backend matching '%s'", mem_name);
+		return -ENOSYS;
+	}
+
+	queue->base.mem = mem;
+	return 0;
+}
+
+const struct xnvme_be_mem *
+xnvme_queue_get_mem_ops(const struct xnvme_queue *queue)
+{
+	if (!queue || !queue->base.dev) {
+		return NULL;
+	}
+
+	return queue->base.mem ? queue->base.mem : &queue->base.dev->be.mem;
+}
+
 int
 xnvme_queue_term(struct xnvme_queue *queue)
 {
@@ -39,6 +82,18 @@ callback_noop(struct xnvme_cmd_ctx *XNVME_UNUSED(ctx), void *XNVME_UNUSED(cb_arg
 int
 xnvme_queue_init(struct xnvme_dev *dev, uint16_t capacity, int opts, struct xnvme_queue **queue)
 {
+	const struct xnvme_queue_attr attr = {
+		.opts = opts,
+	};
+
+	return xnvme_queue_init_with_attr(dev, capacity, &attr, queue);
+}
+
+int
+xnvme_queue_init_with_attr(struct xnvme_dev *dev, uint16_t capacity,
+			   const struct xnvme_queue_attr *attr,
+			   struct xnvme_queue **queue)
+{
 	size_t queue_nbytes;
 	int err;
 
@@ -63,6 +118,13 @@ xnvme_queue_init(struct xnvme_dev *dev, uint16_t capacity, int opts, struct xnvm
 
 	SLIST_INIT(&(*queue)->base.pool);
 
+	err = queue_bind_mem_policy(*queue, attr);
+	if (err) {
+		free(*queue);
+		*queue = NULL;
+		return err;
+	}
+
 	for (uint32_t i = 0; i <= (*queue)->base.capacity; ++i) {
 		(*queue)->pool_storage[i].dev = dev;
 		(*queue)->pool_storage[i].async.queue = *queue;
@@ -74,7 +136,7 @@ xnvme_queue_init(struct xnvme_dev *dev, uint16_t capacity, int opts, struct xnvm
 		SLIST_INSERT_HEAD(&(*queue)->base.pool, &((*queue)->pool_storage[i]), link);
 	}
 
-	err = dev->be.async.init(*queue, opts);
+	err = dev->be.async.init(*queue, attr ? attr->opts : 0);
 	if (err) {
 		XNVME_DEBUG("FAILED: backend-queue initialization with err: %d", err);
 		free(*queue);
@@ -173,4 +235,77 @@ int
 xnvme_queue_get_completion_fd(struct xnvme_queue *queue)
 {
 	return queue->base.dev->be.async.get_completion_fd(queue);
+}
+
+const char *
+xnvme_queue_get_mem_id(const struct xnvme_queue *queue)
+{
+	const struct xnvme_be_mem *mem = xnvme_queue_get_mem_ops(queue);
+
+	return mem ? mem->id : NULL;
+}
+
+void *
+xnvme_queue_buf_phys_alloc(const struct xnvme_queue *queue, size_t nbytes, uint64_t *phys)
+{
+	const struct xnvme_be_mem *mem = xnvme_queue_get_mem_ops(queue);
+
+	if (!mem) {
+		errno = ENOSYS;
+		return NULL;
+	}
+
+	return mem->buf_alloc(queue->base.dev, nbytes, phys);
+}
+
+void *
+xnvme_queue_buf_phys_realloc(const struct xnvme_queue *queue, void *buf, size_t nbytes,
+			     uint64_t *phys)
+{
+	const struct xnvme_be_mem *mem = xnvme_queue_get_mem_ops(queue);
+
+	if (!mem) {
+		errno = ENOSYS;
+		return NULL;
+	}
+
+	return mem->buf_realloc(queue->base.dev, buf, nbytes, phys);
+}
+
+void
+xnvme_queue_buf_phys_free(const struct xnvme_queue *queue, void *buf)
+{
+	const struct xnvme_be_mem *mem = xnvme_queue_get_mem_ops(queue);
+
+	if (!mem) {
+		return;
+	}
+
+	mem->buf_free(queue->base.dev, buf);
+}
+
+int
+xnvme_queue_buf_vtophys(const struct xnvme_queue *queue, void *buf, uint64_t *phys)
+{
+	const struct xnvme_be_mem *mem = xnvme_queue_get_mem_ops(queue);
+
+	return mem ? mem->buf_vtophys(queue->base.dev, buf, phys) : -ENOSYS;
+}
+
+void *
+xnvme_queue_buf_alloc(const struct xnvme_queue *queue, size_t nbytes)
+{
+	return xnvme_queue_buf_phys_alloc(queue, nbytes, NULL);
+}
+
+void *
+xnvme_queue_buf_realloc(const struct xnvme_queue *queue, void *buf, size_t nbytes)
+{
+	return xnvme_queue_buf_phys_realloc(queue, buf, nbytes, NULL);
+}
+
+void
+xnvme_queue_buf_free(const struct xnvme_queue *queue, void *buf)
+{
+	xnvme_queue_buf_phys_free(queue, buf);
 }
