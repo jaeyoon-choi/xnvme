@@ -62,7 +62,8 @@ nvme_qpair_init(struct nvme_qpair *qp, uint32_t qid, uint16_t depth, uint8_t *ba
 		struct hostmem_heap *heap)
 {
 	int dstrd = nvme_reg_cap_get_dstrd(nvme_mmio_cap_read(bar0));
-	size_t nbytes = 1024 * 64;
+	size_t sq_nbytes = depth * sizeof(struct nvme_command);
+	size_t cq_nbytes = depth * sizeof(struct nvme_completion);
 	int err;
 
 	qp->heap = heap;
@@ -75,20 +76,27 @@ nvme_qpair_init(struct nvme_qpair *qp, uint32_t qid, uint16_t depth, uint8_t *ba
 	qp->depth = depth;
 	qp->phase = 1;
 
-	qp->sq = hostmem_dma_alloc_array(qp->heap, 1, nbytes);
+	if (!hostmem_config_uses_hugepages(heap->config) &&
+	    (sq_nbytes > (size_t)heap->config->pagesize ||
+	     cq_nbytes > (size_t)heap->config->pagesize)) {
+		UPCIE_DEBUG("FAILED: queue memory exceeds page size without hugepages");
+		return -ENOTSUP;
+	}
+
+	qp->sq = hostmem_dma_alloc_array(qp->heap, depth, sizeof(struct nvme_command));
 	if (!qp->sq) {
 		UPCIE_DEBUG("FAILED: hostmem_dma_alloc_array(sq); errno(%d)", errno);
 		return -errno;
 	}
-	memset(qp->sq, 0, nbytes);
+	memset(qp->sq, 0, sq_nbytes);
 
-	qp->cq = hostmem_dma_alloc_array(qp->heap, 1, nbytes);
+	qp->cq = hostmem_dma_alloc_array(qp->heap, depth, sizeof(struct nvme_completion));
 	if (!qp->cq) {
 		UPCIE_DEBUG("FAILED: hostmem_dma_alloc_array(cq); errno(%d)", errno);
 		hostmem_dma_free(qp->heap, qp->sq);
 		return -errno;
 	}
-	memset(qp->cq, 0, nbytes);
+	memset(qp->cq, 0, cq_nbytes);
 
 	qp->rpool = calloc(1, sizeof(*qp->rpool));
 	if (!qp->rpool) {

@@ -18,13 +18,31 @@ xnvme_be_upcie_queue_init(struct xnvme_queue *queue, int XNVME_UNUSED(opts))
 {
 	struct xnvme_queue_upcie *upcie_queue = (void *)(queue);
 	struct xnvme_be_upcie_state *state = (void *)queue->base.dev->be.state;
+	uint16_t max_sq_entries = g_upcie_rte.config.pagesize / sizeof(struct nvme_command);
+	uint16_t requested = queue->base.capacity + 1;
+	uint16_t qdepth;
 	int err;
 
 	// The spec says that for systems where memory ordering is not guaranteed, then one should
 	// leave room in the queue to avoid races. Thus, we do so here, by allocating one more than
 	// what is needed.
-	err = nvme_controller_create_io_qpair(state->ctrlr->ctrl, &upcie_queue->qpair,
-					      queue->base.capacity + 1);
+	qdepth = requested;
+	if (!hostmem_config_uses_hugepages(&g_upcie_rte.config)) {
+		if (queue->base.capacity >= max_sq_entries) {
+			XNVME_DEBUG("FAILED: no-hugepage mode supports async queue capacity up to %u",
+				    max_sq_entries - 1);
+			return -ENOTSUP;
+		}
+
+		/*
+		 * Keep the userspace-visible queue capacity unchanged, but back it with a
+		 * full single-page SQ/CQ pair internally. This avoids tiny queue setups in
+		 * no-hugepage mode while still fitting within page-backed contiguous memory.
+		 */
+		qdepth = max_sq_entries;
+	}
+
+	err = nvme_controller_create_io_qpair(state->ctrlr->ctrl, &upcie_queue->qpair, qdepth);
 	if (err) {
 		XNVME_DEBUG("FAILED: nvme_controller_create_io_qpair()");
 		return err;

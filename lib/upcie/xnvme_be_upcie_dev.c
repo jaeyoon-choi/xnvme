@@ -70,8 +70,41 @@ _rte_term(void)
  * already initialized, then it exits early.
  */
 static int
+_rte_heap_nbytes(struct hostmem_config *config, size_t *heap_nbytes)
+{
+	const char *env;
+	char *endptr = NULL;
+	unsigned long long mb = 0;
+
+	if (!heap_nbytes) {
+		return -EINVAL;
+	}
+
+	env = getenv("HOSTMEM_HEAP_MB");
+	if (env && env[0]) {
+		mb = strtoull(env, &endptr, 10);
+		if (!mb || (endptr && endptr[0])) {
+			return -EINVAL;
+		}
+		*heap_nbytes = mb * 1024ULL * 1024ULL;
+		return 0;
+	}
+
+	/*
+	 * Hugepage-backed mode keeps the original 256 MiB heap. Plain-page mode
+	 * uses a smaller default so VFIO does not need to install tens of
+	 * thousands of 4 KiB IOMMU mappings during controller open.
+	 */
+	*heap_nbytes = hostmem_config_uses_hugepages(config) ? 256ULL * 1024ULL * 1024ULL
+							 : 32ULL * 1024ULL * 1024ULL;
+
+	return 0;
+}
+
+static int
 _rte_init(void)
 {
+	size_t heap_nbytes;
 	int err;
 
 	if (g_upcie_rte.is_initialized) {
@@ -84,7 +117,13 @@ _rte_init(void)
 		return err;
 	}
 
-	err = hostmem_heap_init(&g_upcie_rte.heap, 256 * 1024 * 1024, &g_upcie_rte.config);
+	err = _rte_heap_nbytes(&g_upcie_rte.config, &heap_nbytes);
+	if (err) {
+		XNVME_DEBUG("FAILED: _rte_heap_nbytes(); err(%d)", err);
+		return err;
+	}
+
+	err = hostmem_heap_init(&g_upcie_rte.heap, heap_nbytes, &g_upcie_rte.config);
 	if (err) {
 		XNVME_DEBUG("FAILED: hostmem_heap_init(); err(%d)", err);
 		return err;
@@ -217,18 +256,20 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 		return NULL;
 	}
 
-	err = nvme_controller_create_io_qpair(ctrlr->ctrl, &ctrlr->sync, 16);
-	if (err) {
-		XNVME_DEBUG("FAILED: nvme_controller_create_io_qpair(%d)", err);
-		errno = -err;
-		if (ctrlr->is_vfio) {
-			nvme_controller_close_vfio(ctrlr->ctrl, &ctrlr->vfio);
-		} else {
-			nvme_controller_close(ctrlr->ctrl);
+	if (hostmem_config_uses_hugepages(&g_upcie_rte.config)) {
+		err = xnvme_be_upcie_ctrlr_ensure_sync_qpair(ctrlr);
+		if (err) {
+			XNVME_DEBUG("FAILED: xnvme_be_upcie_ctrlr_ensure_sync_qpair(%d)", err);
+			errno = -err;
+			if (ctrlr->is_vfio) {
+				nvme_controller_close_vfio(ctrlr->ctrl, &ctrlr->vfio);
+			} else {
+				nvme_controller_close(ctrlr->ctrl);
+			}
+			free(ctrlr->ctrl);
+			free(ctrlr);
+			return NULL;
 		}
-		free(ctrlr->ctrl);
-		free(ctrlr);
-		return NULL;
 	}
 
 	g_ctrlr_count++;
@@ -237,11 +278,23 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 }
 
 int
+xnvme_be_upcie_ctrlr_ensure_sync_qpair(struct xnvme_be_upcie_ctrlr *ctrlr)
+{
+	if (ctrlr->sync.rpool) {
+		return 0;
+	}
+
+	return nvme_controller_create_io_qpair(ctrlr->ctrl, &ctrlr->sync, 16);
+}
+
+int
 xnvme_be_upcie_ctrlr_term(void *handle)
 {
 	struct xnvme_be_upcie_ctrlr *ctrlr = handle;
 
-	nvme_qpair_term(&ctrlr->sync);
+	if (ctrlr->sync.rpool) {
+		nvme_qpair_term(&ctrlr->sync);
+	}
 	if (ctrlr->is_vfio) {
 		nvme_controller_close_vfio(ctrlr->ctrl, &ctrlr->vfio);
 	} else {

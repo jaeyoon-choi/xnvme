@@ -19,6 +19,12 @@ xnvme_be_upcie_sync_cmd_io(struct xnvme_cmd_ctx *ctx, void *dbuf, size_t dbuf_nb
 	struct nvme_completion *cpl = (struct nvme_completion *)&ctx->cpl;
 	int err;
 
+	err = xnvme_be_upcie_ctrlr_ensure_sync_qpair(state->ctrlr);
+	if (err) {
+		XNVME_DEBUG("FAILED: xnvme_be_upcie_ctrlr_ensure_sync_qpair(); err(%d)", err);
+		return err;
+	}
+
 	switch (ctx->cmd.common.opcode) {
 	case XNVME_SPEC_FS_OPC_READ:
 		ctx->cmd.nvm.slba = ctx->cmd.nvm.slba >> ctx->dev->geo.ssw;
@@ -62,6 +68,12 @@ xnvme_be_upcie_sync_cmd_iov(struct xnvme_cmd_ctx *ctx, struct iovec *dvec, size_
 	struct nvme_command *cmd = (struct nvme_command *)&ctx->cmd;
 	struct nvme_completion *cpl = (struct nvme_completion *)&ctx->cpl;
 	int err;
+
+	err = xnvme_be_upcie_ctrlr_ensure_sync_qpair(state->ctrlr);
+	if (err) {
+		XNVME_DEBUG("FAILED: xnvme_be_upcie_ctrlr_ensure_sync_qpair(); err(%d)", err);
+		return err;
+	}
 
 	switch (ctx->cmd.common.opcode) {
 	case XNVME_SPEC_FS_OPC_READ:

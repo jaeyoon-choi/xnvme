@@ -161,7 +161,7 @@ nvme_request_get(struct nvme_request_pool *pool, uint16_t cid)
  * Caveats
  * -------
  *
- * - Assumes that the memory backing `dbuf` in `heap` is physically contiguous.
+ * - Assumes that `dbuf` is page-aligned and allocated from `heap`.
  * - Does *not* support PRP list chaining; only a single list page is constructed.
  *
  * @param request Pointer to the NVMe request context used for tracking and metadata.
@@ -176,6 +176,7 @@ nvme_request_prep_command_prps_contig(struct nvme_request *request, struct hostm
 {
 	const uint64_t npages = (dbuf_nbytes + heap->config->pagesize - 1) >> heap->config->pagesize_shift;
 	const uint64_t pagesize = heap->config->pagesize;
+	uint8_t *base = dbuf;
 
 	/* Chaining is not supported, thus assert that the given dbuf fits. */
 	assert(npages <= 1 + 512);
@@ -185,14 +186,14 @@ nvme_request_prep_command_prps_contig(struct nvme_request *request, struct hostm
 	if (npages == 1) {
 		return;
 	} else if (npages == 2) {
-		cmd->prp2 = hostmem_dma_v2p(heap, dbuf + pagesize);
+		cmd->prp2 = hostmem_dma_v2p(heap, base + pagesize);
 	} else {
 		uint64_t *prp_list = request->prp;
 
 		cmd->prp2 = request->prp_addr;
 		for (uint64_t i = 1; i < npages; ++i) {
-
-			prp_list[i - 1] = cmd->prp1 + (i << heap->config->pagesize_shift);
+			prp_list[i - 1] =
+				hostmem_dma_v2p(heap, base + (i << heap->config->pagesize_shift));
 		}
 	}
 }

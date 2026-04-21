@@ -23,6 +23,7 @@ CPUMASK="0x1"
 WORKLOAD_PAUSE="5"
 DRIVERS_CSV="uio_pci_generic,vfio-pci"
 OUTDIR=""
+NO_HUGEPAGE=0
 
 SUMMARY_CSV=""
 SUMMARY_RUNS_CSV=""
@@ -60,6 +61,7 @@ Common options:
   --drivers CSV          Drivers to benchmark (default: uio_pci_generic,vfio-pci)
   --outdir PATH          Output directory
   --huge-mem MB          Pass HUGEMEM=MB to xnvme-driver (default: 2048)
+  --no-hugepage         Use page-backed memfd for upcie hostmem
   --xnvme PATH           xnvme binary (default: builddir/tools/xnvme)
   --driver-script PATH   xnvme-driver helper (default: toolbox/xnvme-driver.sh)
   --keep-binding         Do not call xnvme-driver reset on exit
@@ -95,6 +97,20 @@ run_root() {
 	else
 		command -v sudo >/dev/null 2>&1 || die "sudo is required when not running as root"
 		sudo "$@"
+	fi
+}
+
+run_upcie_root() {
+	local -a env_args=()
+
+	if [[ "$NO_HUGEPAGE" -eq 1 ]]; then
+		env_args+=("HOSTMEM_NO_HUGEPAGE=1")
+	fi
+
+	if [[ "${#env_args[@]}" -gt 0 ]]; then
+		run_root env "${env_args[@]}" "$@"
+	else
+		run_root "$@"
 	fi
 }
 
@@ -227,6 +243,18 @@ EOF
 	esac
 }
 
+case_supported() {
+	local pattern="$1"
+	local iosize="$2"
+	local qdepth="$3"
+
+	if [[ "$NO_HUGEPAGE" -eq 1 && "$qdepth" -ge 64 ]]; then
+		return 1
+	fi
+
+	return 0
+}
+
 parse_xnvmeperf_output() {
 	local logfile="$1"
 
@@ -320,7 +348,9 @@ configure_driver() {
 	local -a env_args
 
 	env_args=("PCI_WHITELIST=${BDF}" "DRIVER_OVERRIDE=${driver}")
-	if [[ -n "$HUGEMEM" ]]; then
+	if [[ "$NO_HUGEPAGE" -eq 1 ]]; then
+		env_args+=("SKIP_HUGEPAGES=1")
+	elif [[ -n "$HUGEMEM" ]]; then
 		env_args+=("HUGEMEM=${HUGEMEM}")
 	fi
 
@@ -334,7 +364,7 @@ capture_device_info() {
 	local info_log="${driver_dir}/device-info.txt"
 
 	log "Verifying ${BDF} opens with be=upcie on ${driver}"
-	run_root "${XNVME_BIN}" info --be upcie --dev-nsid "${NSID}" "${BDF}" 2>&1 | tee "$info_log"
+	run_upcie_root "${XNVME_BIN}" info --be upcie --dev-nsid "${NSID}" "${BDF}" 2>&1 | tee "$info_log"
 	LAST_INFO_LOG="$info_log"
 }
 
@@ -357,7 +387,7 @@ run_case_xnvmeperf() {
 	raw_log="${driver_dir}/${pattern}_bs${iosize}_qd${qdepth}_run$(printf '%02d' "${iteration}").log"
 
 	log "Running ${driver}: pattern=${pattern}, iosize=${iosize}, qdepth=${qdepth}, run=${iteration}/${REPEAT}"
-	run_root "${XNVMEPERF_BIN}" run \
+	run_upcie_root "${XNVMEPERF_BIN}" run \
 		--be upcie \
 		--iopattern "${pattern}" \
 		--qdepth "${qdepth}" \
@@ -429,7 +459,7 @@ run_case_fio() {
 	)
 
 	log "Running ${driver}: pattern=${pattern}, iosize=${iosize}, qdepth=${qdepth}, run=${iteration}/${REPEAT}"
-	run_root "${fio_args[@]}" 2>&1 | tee "$log_file" >/dev/null
+	run_upcie_root "${fio_args[@]}" 2>&1 | tee "$log_file" >/dev/null
 	extract_fio_json "$log_file" "$json_file" || die "Failed to extract fio JSON from ${log_file}"
 
 	metrics=$(parse_fio_json "$json_file" "$pattern") || die "Failed to parse fio JSON in ${json_file}"
@@ -603,6 +633,7 @@ write_metadata() {
 		printf 'profile=%s\n' "$PROFILE"
 		printf 'drivers=%s\n' "$DRIVERS_CSV"
 		printf 'huge_mem_mb=%s\n' "${HUGEMEM:-default}"
+		printf 'no_hugepage=%s\n' "$NO_HUGEPAGE"
 		printf 'xnvme=%s\n' "$XNVME_BIN"
 		printf 'driver_script=%s\n' "$XNVME_DRIVER"
 		case "$RUNNER" in
@@ -711,6 +742,10 @@ while [[ $# -gt 0 ]]; do
 		HUGEMEM="${2:-}"
 		shift 2
 		;;
+	--no-hugepage)
+		NO_HUGEPAGE=1
+		shift
+		;;
 	--outdir)
 		OUTDIR="${2:-}"
 		shift 2
@@ -800,6 +835,10 @@ log "Runner ${RUNNER} will benchmark ${BDF} with nsid=${NSID} using be=upcie"
 
 while read -r pattern iosize qdepth; do
 	[[ -n "$pattern" ]] || continue
+	if ! case_supported "$pattern" "$iosize" "$qdepth"; then
+		log "Skipping ${pattern}/${iosize}/qd${qdepth} in no-hugepage mode"
+		continue
+	fi
 	CASES+=("${pattern} ${iosize} ${qdepth}")
 done < <(build_cases)
 

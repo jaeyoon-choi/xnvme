@@ -73,6 +73,8 @@ void *
 xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev);
 int
 xnvme_be_upcie_ctrlr_term(void *handle);
+int
+xnvme_be_upcie_ctrlr_ensure_sync_qpair(struct xnvme_be_upcie_ctrlr *ctrlr);
 
 // Used by xnvme_be_upcie_cuda_async.c
 int

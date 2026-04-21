@@ -183,11 +183,13 @@ nvme_controller_open_vfio(struct nvme_controller *ctrlr, struct vfio_ctx *vfio, 
 	int group_id = -1;
 	uint64_t cap;
 	void *bar0;
+	uint16_t aq_depth;
 	int err;
 
 	memset(ctrlr, 0, sizeof(*ctrlr));
 	nvme_vfio_ctx_init(vfio);
 	ctrlr->heap = heap;
+	aq_depth = nvme_controller_admin_qdepth(heap);
 
 	ctrlr->buf = hostmem_dma_malloc(ctrlr->heap, 4096);
 	if (!ctrlr->buf) {
@@ -311,7 +313,7 @@ nvme_controller_open_vfio(struct nvme_controller *ctrlr, struct vfio_ctx *vfio, 
 		goto fail;
 	}
 
-	err = nvme_qpair_init(&ctrlr->aq, 0, 256, bar0, ctrlr->heap);
+	err = nvme_qpair_init(&ctrlr->aq, 0, aq_depth, bar0, ctrlr->heap);
 	if (err) {
 		UPCIE_DEBUG("FAILED: nvme_qpair_init(aq); err(%d)", err);
 		goto fail;

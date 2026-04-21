@@ -222,6 +222,7 @@ function usage()
 	echo "HUGENODE          Specific NUMA node to allocate hugepages on. To allocate"
 	echo "                  hugepages on multiple nodes run this script multiple times -"
 	echo "                  once for each node."
+	echo "SKIP_HUGEPAGES    Skip hugetlbfs mount and hugepage allocation."
 	echo "PCI_WHITELIST"
 	echo "PCI_BLACKLIST     Whitespace separated list of PCI devices (NVMe, I/OAT, VMD, Virtio)."
 	echo "                  Each device must be specified as a full PCI address."
@@ -523,37 +524,42 @@ function cleanup_linux {
 
 function configure_linux {
 	configure_linux_pci
-	hugetlbfs_mounts=$(linux_hugetlbfs_mounts)
-
-	if [ -z "$hugetlbfs_mounts" ]; then
-		hugetlbfs_mounts=/mnt/huge
-		echo "Mounting hugetlbfs at $hugetlbfs_mounts"
-		mkdir -p "$hugetlbfs_mounts"
-		mount -t hugetlbfs nodev "$hugetlbfs_mounts"
-	fi
-
-	if [ -z "$HUGENODE" ]; then
-		hugepages_target="/proc/sys/vm/nr_hugepages"
+	if [ -n "$SKIP_HUGEPAGES" ] && [ "$SKIP_HUGEPAGES" != "0" ]; then
+		echo "Skipping hugepage configuration"
 	else
-		hugepages_target="/sys/devices/system/node/node${HUGENODE}/hugepages/hugepages-${HUGEPGSZ}kB/nr_hugepages"
-	fi
+		hugetlbfs_mounts=$(linux_hugetlbfs_mounts)
 
-	echo "$NRHUGE" > "$hugepages_target"
-	allocated_hugepages=$(cat $hugepages_target)
-	if [ "$allocated_hugepages" -lt "$NRHUGE" ]; then
-		echo ""
-		echo "## ERROR: requested $NRHUGE hugepages but only $allocated_hugepages could be allocated."
-		echo "## Memory might be heavily fragmented. Please try flushing the system cache, or reboot the machine."
-		exit 1
-	fi
+		if [ -z "$hugetlbfs_mounts" ]; then
+			hugetlbfs_mounts=/mnt/huge
+			echo "Mounting hugetlbfs at $hugetlbfs_mounts"
+			mkdir -p "$hugetlbfs_mounts"
+			mount -t hugetlbfs nodev "$hugetlbfs_mounts"
+		fi
 
-	if [ "$driver_name" = "vfio-pci" ]; then
-		if [ -n "$TARGET_USER" ]; then
+		if [ -z "$HUGENODE" ]; then
+			hugepages_target="/proc/sys/vm/nr_hugepages"
+		else
+			hugepages_target="/sys/devices/system/node/node${HUGENODE}/hugepages/hugepages-${HUGEPGSZ}kB/nr_hugepages"
+		fi
+
+		echo "$NRHUGE" > "$hugepages_target"
+		allocated_hugepages=$(cat $hugepages_target)
+		if [ "$allocated_hugepages" -lt "$NRHUGE" ]; then
+			echo ""
+			echo "## ERROR: requested $NRHUGE hugepages but only $allocated_hugepages could be allocated."
+			echo "## Memory might be heavily fragmented. Please try flushing the system cache, or reboot the machine."
+			exit 1
+		fi
+
+		if [ "$driver_name" = "vfio-pci" ] && [ -n "$TARGET_USER" ]; then
 			for mount in $hugetlbfs_mounts; do
 				chown "$TARGET_USER" "$mount"
 				chmod g+w "$mount"
 			done
 		fi
+	fi
+
+	if [ "$driver_name" = "vfio-pci" ]; then
 
 		MEMLOCK_AMNT=$(ulimit -l)
 		if [ "$MEMLOCK_AMNT" != "unlimited" ] ; then

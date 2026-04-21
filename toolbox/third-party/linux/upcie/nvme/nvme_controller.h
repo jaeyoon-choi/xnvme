@@ -47,6 +47,12 @@ nvme_controller_close(struct nvme_controller *ctrlr)
 	memset(ctrlr, 0, sizeof(*ctrlr));
 }
 
+static inline uint16_t
+nvme_controller_admin_qdepth(const struct hostmem_heap *heap)
+{
+	return hostmem_config_uses_hugepages(heap->config) ? 256 : 64;
+}
+
 /**
  * Disables the NVMe controller at 'bdf', sets up admin-queues and enables it again
  */
@@ -55,10 +61,12 @@ nvme_controller_open(struct nvme_controller *ctrlr, const char *bdf, struct host
 {
 	uint64_t cap;
 	void *bar0;
+	uint16_t aq_depth;
 	int err;
 
 	memset(ctrlr, 0, sizeof(*ctrlr));
 	ctrlr->heap = heap;
+	aq_depth = nvme_controller_admin_qdepth(heap);
 
 	ctrlr->buf = hostmem_dma_malloc(ctrlr->heap, 4096);
 	if (!ctrlr->buf) {
@@ -94,7 +102,7 @@ nvme_controller_open(struct nvme_controller *ctrlr, const char *bdf, struct host
 		return -err;
 	}
 
-	err = nvme_qpair_init(&ctrlr->aq, 0, 256, ctrlr->func.bars[0].region, ctrlr->heap);
+	err = nvme_qpair_init(&ctrlr->aq, 0, aq_depth, ctrlr->func.bars[0].region, ctrlr->heap);
 	if (err) {
 		UPCIE_DEBUG("FAILED: nvme_qpair_init(); err(%d)", err);
 		return -err;
