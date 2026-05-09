@@ -142,17 +142,101 @@ def plot_dual_series(
     plt.savefig(output_path)
 
 
+def _is_multi_items(items):
+    return bool(items) and "devcount" in items[0].get("ctx", {})
+
+
+def _aggregate_multi(items):
+    """Group multi-device items by (rw, iosize, devcount, iodepth) and sum
+    IOPS / mean latency across devices. Returns a list with the same shape
+    as single-device entries (one record per workload point) so it can be
+    fed straight into the existing plot_* helpers via plot_iops/latency.
+    """
+    by_iod = defaultdict(list)
+    for it in items:
+        c = it["ctx"]
+        by_iod[(c["rw"], c["iosize"], int(c["devcount"]), int(c["iodepth"]))].append(it)
+
+    grouped = defaultdict(list)
+    for (rw, iosize, devcount, iod), per_dev in by_iod.items():
+        u_iops = sum(it["uio"]["iops"] for it in per_dev)
+        v_iops = sum(it["vfio"]["iops"] for it in per_dev)
+        u_lat = sum(it["uio"]["lat_ns"] for it in per_dev) / len(per_dev)
+        v_lat = sum(it["vfio"]["lat_ns"] for it in per_dev) / len(per_dev)
+        u_tail = {p: sum(it["uio"]["tail_lat_ns"][p] for it in per_dev) / len(per_dev)
+                  for p, _ in TAIL_LATENCIES}
+        v_tail = {p: sum(it["vfio"]["tail_lat_ns"][p] for it in per_dev) / len(per_dev)
+                  for p, _ in TAIL_LATENCIES}
+        agg = {
+            "ctx": {"rw": rw, "iosize": iosize, "iodepth": iod, "devcount": devcount},
+            "uio": {"iops": u_iops, "lat_ns": u_lat, "tail_lat_ns": u_tail},
+            "vfio": {"iops": v_iops, "lat_ns": v_lat, "tail_lat_ns": v_tail},
+        }
+        # Forward xnvmeperf cross-check for N=1 (a single per-device entry).
+        if devcount == 1 and per_dev[0]["ctx"].get("has_xnvmeperf"):
+            agg["uio"]["xnvmeperf_iops"] = per_dev[0]["uio"]["xnvmeperf_iops"]
+            agg["vfio"]["xnvmeperf_iops"] = per_dev[0]["vfio"]["xnvmeperf_iops"]
+            agg["ctx"]["has_xnvmeperf"] = True
+        grouped[(rw, iosize, devcount)].append(agg)
+
+    for entries in grouped.values():
+        entries.sort(key=lambda it: it["ctx"]["iodepth"])
+    return grouped
+
+
+def plot_xnvmeperf_iops(entries, output_path):
+    plot_dual_series(
+        entries, output_path, y_key="xnvmeperf_iops",
+        ylabel="xnvmeperf IOPS (cross-check)",
+        legend_uio="uio_pci_generic (IOMMU off)",
+        legend_vfio="vfio-pci (IOMMU on)",
+    )
+
+
+def _create_plots_multi(args, comparison):
+    artifacts = args.output / "artifacts"
+    os.makedirs(artifacts, exist_ok=True)
+    for path in artifacts.glob(
+        "upcie_iommu_overhead_RW=*_IOSIZE=*_DEVCOUNT=*_TYPE=*.png"
+    ):
+        path.unlink()
+
+    for (rw, iosize, devcount), entries in _aggregate_multi(
+        comparison["items"]
+    ).items():
+        prefix = (
+            f"upcie_iommu_overhead_RW={safe_name(rw)}_IOSIZE={iosize}"
+            f"_DEVCOUNT={devcount}"
+        )
+        plot_iops(entries, artifacts / f"{prefix}_TYPE=iops.png")
+        plot_latency(entries, artifacts / f"{prefix}_TYPE=latency.png")
+        for percentile, label in TAIL_LATENCIES:
+            plot_tail_latency(
+                entries,
+                artifacts / f"{prefix}_TYPE={percentile}_latency.png",
+                percentile, label,
+            )
+        if devcount == 1 and entries and entries[0]["ctx"].get("has_xnvmeperf"):
+            plot_xnvmeperf_iops(
+                entries, artifacts / f"{prefix}_TYPE=xnvmeperf_iops.png"
+            )
+    return 0
+
+
 def create_plots(args):
     search = args.path or args.output
     if not search:
         return errno.EINVAL
+
+    comparison = load_comparison(search)
+    if _is_multi_items(comparison["items"]):
+        return _create_plots_multi(args, comparison)
 
     artifacts = args.output / "artifacts"
     os.makedirs(artifacts, exist_ok=True)
     for path in artifacts.glob("upcie_iommu_overhead_RW=*_IOSIZE=*_TYPE=*.png"):
         path.unlink()
 
-    comparison = load_comparison(search)
     for (rw, iosize), entries in grouped_items(comparison["items"]).items():
         prefix = f"upcie_iommu_overhead_RW={safe_name(rw)}_IOSIZE={iosize}"
         plot_iops(entries, artifacts / f"{prefix}_TYPE=iops.png")

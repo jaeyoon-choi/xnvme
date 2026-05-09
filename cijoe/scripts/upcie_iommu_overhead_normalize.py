@@ -33,6 +33,23 @@ FIO_STEM_REGEX = re.compile(
     r"LABEL=(?P<label>.+)_GROUP=(?P<group>.+)_RW=(?P<rw>.+)_"
     r"REP=(?P<rep>\d+)"
 )
+
+# Multi-device patterns: artifact filenames carry DEVCOUNT/DEV prefixes so
+# the same workload run from N devices stays separable.
+_BDF_SAFE = r"[0-9a-fA-F]+_[0-9a-fA-F]+_[0-9a-fA-F]+_[0-9a-fA-F]+"
+MULTI_XNVMEPERF_STEM_REGEX = re.compile(
+    r"xnvmeperf-output_DEV=(?P<dev>" + _BDF_SAFE + r")_"
+    r"DEVCOUNT=(?P<devcount>\d+)_"
+    r"IOSIZE=(?P<iosize>\d+)_IODEPTH=(?P<iodepth>\d+)_"
+    r"LABEL=(?P<label>.+)_GROUP=(?P<group>.+)_RW=(?P<rw>.+)_"
+    r"REP=(?P<rep>\d+)"
+)
+MULTI_FIO_STEM_REGEX = re.compile(
+    r"fio-output_DEVCOUNT=(?P<devcount>\d+)_"
+    r"IOSIZE=(?P<iosize>\d+)_IODEPTH=(?P<iodepth>\d+)_"
+    r"LABEL=(?P<label>.+)_GROUP=(?P<group>.+)_RW=(?P<rw>.+)_"
+    r"REP=(?P<rep>\d+)"
+)
 ELAPSED_REGEX = re.compile(r"xnvmeperf \(elapsed:\s*(?P<elapsed>\d+(?:\.\d+)?)s\)")
 TOTAL_REGEX = re.compile(
     r"^\s*Total\s*:\s+(?P<iops>\d+(?:\.\d+)?)\s+"
@@ -119,8 +136,139 @@ def stable_ident(context):
     return digest.hexdigest()
 
 
+def _bdf_from_safe(value):
+    s = str(value)
+    head, _, func = s.rpartition("_")
+    head, _, dev = head.rpartition("_")
+    domain, _, bus = head.rpartition("_")
+    return f"{domain}:{bus}:{dev}.{func}"
+
+
+def _bdf_from_fio_filename(value):
+    return str(value).replace("\\:", ":")
+
+
+def _parse_fio_jobs_per_device(path, rw):
+    """Multi-device fio output: returns [(bdf, parsed), ...] one per job.
+    BDF is recovered from each job's job_options.filename.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    jobs = data.get("jobs") or []
+    if not jobs:
+        raise ValueError(f"fio output has no jobs: {path}")
+    kind = "read" if "read" in rw else "write"
+    results = []
+    for job in jobs:
+        opts = job.get("job options", job.get("job_options", {}))
+        filename = opts.get("filename")
+        if not filename:
+            raise ValueError(
+                f"fio job missing job_options.filename: "
+                f"jobname={job.get('jobname')!r} path={path}"
+            )
+        section = job.get(kind, {})
+        lat_ns = section.get("lat_ns", {})
+        clat_ns = section.get("clat_ns", {})
+        percentile = clat_ns.get("percentile", lat_ns.get("percentile", {}))
+        if not lat_ns:
+            raise ValueError(
+                f"fio job has no {kind}.lat_ns: jobname={job.get('jobname')!r}"
+            )
+        results.append((
+            _bdf_from_fio_filename(filename),
+            {
+                "iops": float(section.get("iops", 0.0)),
+                "lat_ns": float(lat_ns.get("mean", 0.0)),
+                "tail_lat_ns": {
+                    name: float(percentile.get(fio_key, 0))
+                    for name, fio_key in TAIL_LATENCIES.items()
+                },
+            },
+        ))
+    return results
+
+
+def _normalize_multi(args):
+    """Multi-device normalisation. Produces per-(workload, devcount, dev)
+    entries with a `devcount`/`dev` ctx field absent in the single-device
+    flow. Optional xnvmeperf cross-check (single-device runs only) merges
+    in as `xnvmeperf_iops`.
+    """
+    search = Path(args.path or args.output)
+
+    fio_groups = OrderedDict()
+    for path in sorted(search.rglob("fio-output_DEVCOUNT=*")):
+        match = MULTI_FIO_STEM_REGEX.match(path.stem)
+        if not match:
+            continue
+        rw = match.group("rw")
+        devcount = int(match.group("devcount"))
+        for bdf, parsed in _parse_fio_jobs_per_device(path, rw):
+            key = (
+                match.group("label"), match.group("group"),
+                rw,
+                int(match.group("iosize")), int(match.group("iodepth")),
+                devcount, bdf,
+            )
+            fio_groups.setdefault(key, []).append(parsed)
+
+    if not fio_groups:
+        log.error("No fio-output_DEVCOUNT=*.txt files found")
+        return errno.ENOENT
+
+    xnvmeperf_groups = OrderedDict()
+    for path in sorted(search.rglob("xnvmeperf-output_DEV=*")):
+        match = MULTI_XNVMEPERF_STEM_REGEX.match(path.stem)
+        if not match:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        total = TOTAL_REGEX.search(text)
+        if not total:
+            raise ValueError(f"failed to parse xnvmeperf output: {path}")
+        key = (
+            match.group("label"), match.group("group"), match.group("rw"),
+            int(match.group("iosize")), int(match.group("iodepth")),
+            int(match.group("devcount")), _bdf_from_safe(match.group("dev")),
+        )
+        xnvmeperf_groups.setdefault(key, []).append(float(total.group("iops")))
+
+    collection = []
+    for key, samples in fio_groups.items():
+        label, group, rw, iosize, iodepth, devcount, dev = key
+        iops = [s["iops"] for s in samples]
+        lat = [s["lat_ns"] for s in samples]
+        tail_lat = {
+            n: [s["tail_lat_ns"][n] for s in samples] for n in TAIL_LATENCIES
+        }
+        xperf = xnvmeperf_groups.get(key) or []
+        context = {
+            "rw": rw, "iosize": iosize, "iodepth": iodepth,
+            "devcount": devcount, "dev": dev,
+            "driver": label, "group": group,
+            "repeat": len(samples),
+        }
+        metrics = {
+            "ctx": context,
+            "iops": mean(iops),
+            "iops_cv": cv(iops),
+            "lat_ns": mean(lat),
+            "tail_lat_ns": {n: mean(v) for n, v in tail_lat.items()},
+        }
+        if xperf:
+            metrics["xnvmeperf_iops"] = mean(xperf)
+        collection.append((stable_ident(context), metrics))
+
+    artifacts = Path(args.output) / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    with (artifacts / OUTPUT_NORMALIZED_FILENAME).open("w") as jfd:
+        json.dump(collection, jfd, **JSON_DUMP)
+    return 0
+
+
 def normalize(args):
     search = Path(args.path or args.output)
+    if any(search.rglob("fio-output_DEVCOUNT=*")):
+        return _normalize_multi(args)
 
     xnvmeperf_groups = OrderedDict()
 

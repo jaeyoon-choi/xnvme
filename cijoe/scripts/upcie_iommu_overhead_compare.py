@@ -105,6 +105,88 @@ def metric_fio_iops(metrics):
     return iops
 
 
+def _is_multi(data):
+    """Multi-device normalised entries always carry a `devcount` ctx key."""
+    return bool(data) and "devcount" in data[0][1].get("ctx", {})
+
+
+def _index_by_workload_multi(data):
+    indexed = {}
+    for _, m in data:
+        ctx = m["ctx"]
+        key = (
+            ctx["rw"], int(ctx["iosize"]), int(ctx["iodepth"]),
+            int(ctx["devcount"]), ctx["dev"],
+        )
+        indexed[key] = m
+    return indexed
+
+
+def _compare_multi(args, uio_data, vfio_data, uio_output, vfio_output):
+    """Multi-device comparison. Items keyed by (rw, iosize, iodepth, devcount, dev)
+    with optional xnvmeperf_iops cross-check forwarded for N=1.
+    """
+    uio = _index_by_workload_multi(uio_data)
+    vfio = _index_by_workload_multi(vfio_data)
+    allowed = workload_keys(args.runs)
+    common = set(uio) & set(vfio)
+    if allowed is not None:
+        common = {k for k in common if k[:3] in allowed}
+
+    items = []
+    for key in sorted(common):
+        rw, iosize, iodepth, devcount, dev = key
+        u, v = uio[key], vfio[key]
+        u_iops = float(u["iops"]); v_iops = float(v["iops"])
+        u_lat = float(u["lat_ns"]); v_lat = float(v["lat_ns"])
+        u_tail = {n: float(u["tail_lat_ns"][n]) for n in TAIL_LATENCIES}
+        v_tail = {n: float(v["tail_lat_ns"][n]) for n in TAIL_LATENCIES}
+        has_xperf = "xnvmeperf_iops" in u and "xnvmeperf_iops" in v
+        u_side = {
+            "iops": u_iops, "iops_cv": float(u.get("iops_cv", 0)),
+            "lat_ns": u_lat, "tail_lat_ns": u_tail,
+        }
+        v_side = {
+            "iops": v_iops, "iops_cv": float(v.get("iops_cv", 0)),
+            "lat_ns": v_lat, "tail_lat_ns": v_tail,
+        }
+        if has_xperf:
+            u_side["xnvmeperf_iops"] = float(u["xnvmeperf_iops"])
+            v_side["xnvmeperf_iops"] = float(v["xnvmeperf_iops"])
+        item = {
+            "ctx": {
+                "rw": rw, "iosize": iosize, "iodepth": iodepth,
+                "devcount": devcount, "dev": dev,
+                "has_xnvmeperf": bool(has_xperf),
+            },
+            "uio": u_side, "vfio": v_side,
+            "iops_delta_pct": pct_delta(u_iops, v_iops),
+            "lat_delta_pct": pct_delta(u_lat, v_lat),
+            "tail_lat_delta_pct": {
+                n: pct_delta(u_tail[n], v_tail[n]) for n in TAIL_LATENCIES
+            },
+        }
+        if has_xperf:
+            item["xnvmeperf_iops_delta_pct"] = pct_delta(
+                u_side["xnvmeperf_iops"], v_side["xnvmeperf_iops"]
+            )
+        items.append(item)
+
+    if not items:
+        log.error("No matching workloads found between UIO and VFIO outputs")
+        return errno.ENOENT
+
+    artifacts = Path(args.output) / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "uio_output": str(uio_output), "vfio_output": str(vfio_output),
+        "items": items,
+    }
+    with (artifacts / COMPARISON_JSON).open("w") as jfd:
+        json.dump(payload, jfd, **JSON_DUMP)
+    return 0
+
+
 def compare(args, cijoe):
     uio_output = args.uio_output or cijoe.getconf(
         "upcie_iommu_overhead.compare.uio_output", None
@@ -117,8 +199,13 @@ def compare(args, cijoe):
         log.error("Missing --uio-output and --vfio-output")
         return errno.EINVAL
 
-    uio = index_by_workload(load_normalized(uio_output))
-    vfio = index_by_workload(load_normalized(vfio_output))
+    uio_data = load_normalized(uio_output)
+    vfio_data = load_normalized(vfio_output)
+    if _is_multi(uio_data) or _is_multi(vfio_data):
+        return _compare_multi(args, uio_data, vfio_data, uio_output, vfio_output)
+
+    uio = index_by_workload(uio_data)
+    vfio = index_by_workload(vfio_data)
     allowed_keys = workload_keys(args.runs)
     common_keys = set(uio) & set(vfio)
     if allowed_keys is not None:

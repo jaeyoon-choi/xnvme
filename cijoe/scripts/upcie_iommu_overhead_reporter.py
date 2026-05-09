@@ -144,6 +144,157 @@ def report_sections(plots, rows):
     return sections
 
 
+def _is_multi(comparison):
+    items = comparison.get("items") or []
+    return bool(items) and "devcount" in items[0].get("ctx", {})
+
+
+PLOT_PATH_REGEX_MULTI = (
+    r".*_RW=(?P<rw>.+)_IOSIZE=(?P<iosize>\d+)_DEVCOUNT=(?P<devcount>\d+)"
+    r"_TYPE=(?P<type>.+)\.png"
+)
+
+
+def _plot_groups_multi(artifacts):
+    groups = defaultdict(dict)
+    for path in artifacts.glob(
+        "upcie_iommu_overhead_RW=*_IOSIZE=*_DEVCOUNT=*_TYPE=*.png"
+    ):
+        m = re.match(PLOT_PATH_REGEX_MULTI, path.name)
+        if not m:
+            continue
+        groups[(m.group("rw"), m.group("iosize"), int(m.group("devcount")))][
+            m.group("type")
+        ] = path.name
+    return groups
+
+
+def _pct(base, value):
+    return (value - base) / base * 100.0 if base else float("nan")
+
+
+def _multi_aggregate_rows(items):
+    """One row per (rw, iosize, iodepth, devcount): IOPS sum, latency mean."""
+    by_iod = defaultdict(list)
+    for it in items:
+        c = it["ctx"]
+        by_iod[(c["rw"], int(c["iosize"]), int(c["iodepth"]), int(c["devcount"]))].append(it)
+    rows = []
+    for (rw, iosize, iodepth, devcount), per_dev in by_iod.items():
+        n = len(per_dev)
+        u_iops = sum(it["uio"]["iops"] for it in per_dev)
+        v_iops = sum(it["vfio"]["iops"] for it in per_dev)
+        u_lat = sum(it["uio"]["lat_ns"] for it in per_dev) / n
+        v_lat = sum(it["vfio"]["lat_ns"] for it in per_dev) / n
+        u_tail = {p: sum(it["uio"]["tail_lat_ns"][p] for it in per_dev) / n
+                  for p, _ in TAIL_LATENCIES}
+        v_tail = {p: sum(it["vfio"]["tail_lat_ns"][p] for it in per_dev) / n
+                  for p, _ in TAIL_LATENCIES}
+        u_cv = sum(it["uio"].get("iops_cv", 0) for it in per_dev) / n
+        v_cv = sum(it["vfio"].get("iops_cv", 0) for it in per_dev) / n
+        row = {
+            "rw": rw, "iosize": iosize, "iodepth": iodepth, "devcount": devcount,
+            "uio_iops": f"{u_iops:.2f}", "vfio_iops": f"{v_iops:.2f}",
+            "iops_delta_pct": f"{_pct(u_iops, v_iops):.2f}",
+            "uio_lat_us": f"{u_lat / 1000.0:.2f}",
+            "vfio_lat_us": f"{v_lat / 1000.0:.2f}",
+            "lat_delta_pct": f"{_pct(u_lat, v_lat):.2f}",
+            "uio_iops_cv": f"{u_cv:.2f}", "vfio_iops_cv": f"{v_cv:.2f}",
+            "has_xnvmeperf": False,
+        }
+        for p, _label in TAIL_LATENCIES:
+            row[f"uio_{p}_us"] = f"{u_tail[p] / 1000.0:.2f}"
+            row[f"vfio_{p}_us"] = f"{v_tail[p] / 1000.0:.2f}"
+            row[f"{p}_delta_pct"] = f"{_pct(u_tail[p], v_tail[p]):.2f}"
+        if devcount == 1 and per_dev[0]["ctx"].get("has_xnvmeperf"):
+            u_xp = per_dev[0]["uio"]["xnvmeperf_iops"]
+            v_xp = per_dev[0]["vfio"]["xnvmeperf_iops"]
+            row["has_xnvmeperf"] = True
+            row["uio_xnvmeperf_iops"] = f"{u_xp:.2f}"
+            row["vfio_xnvmeperf_iops"] = f"{v_xp:.2f}"
+            row["xnvmeperf_iops_delta_pct"] = f"{_pct(u_xp, v_xp):.2f}"
+        rows.append(row)
+    return rows
+
+
+def _multi_per_device_rows(items):
+    rows = []
+    for it in items:
+        c = it["ctx"]
+        if int(c["devcount"]) <= 1:
+            continue
+        u_iops = it["uio"]["iops"]; v_iops = it["vfio"]["iops"]
+        u_lat = it["uio"]["lat_ns"]; v_lat = it["vfio"]["lat_ns"]
+        rows.append({
+            "rw": c["rw"], "iosize": c["iosize"], "iodepth": c["iodepth"],
+            "devcount": c["devcount"], "dev": c["dev"],
+            "uio_iops": f"{u_iops:.2f}", "vfio_iops": f"{v_iops:.2f}",
+            "iops_delta_pct": f"{_pct(u_iops, v_iops):.2f}",
+            "uio_lat_us": f"{u_lat / 1000.0:.2f}",
+            "vfio_lat_us": f"{v_lat / 1000.0:.2f}",
+        })
+    rows.sort(key=lambda r: (r["rw"], int(r["iosize"]), int(r["devcount"]),
+                              int(r["iodepth"]), str(r["dev"])))
+    return rows
+
+
+def _multi_sections(plots, agg_rows):
+    grouped = defaultdict(list)
+    for row in agg_rows:
+        grouped[(row["rw"], str(row["iosize"]), int(row["devcount"]))].append(row)
+    sections = []
+    for key, group_plots in sorted(plots.items(), key=lambda i: i[0]):
+        rows = sorted(grouped.get(key, []), key=lambda r: int(r["iodepth"]))
+        sections.append({
+            "rw": key[0], "iosize": key[1], "devcount": key[2],
+            "plots": group_plots, "rows": rows,
+        })
+    return sections
+
+
+def _multi_per_device_groups(per_dev_rows):
+    grouped = defaultdict(list)
+    for row in per_dev_rows:
+        grouped[(row["rw"], str(row["iosize"]), int(row["devcount"]))].append(row)
+    return [
+        {"rw": k[0], "iosize": k[1], "devcount": k[2], "rows": v}
+        for k, v in sorted(grouped.items())
+    ]
+
+
+def _render_multi(args, cijoe, comparison, search_path, artifacts,
+                  templates_path, report_path, style_path, cover_path):
+    body_path = report_path / "report.rst"
+    pdf_path = report_path / "upcie-iommu-overhead.pdf"
+    items = comparison["items"]
+    agg = _multi_aggregate_rows(items)
+    per_dev = _multi_per_device_rows(items)
+    plots = _plot_groups_multi(artifacts)
+    sections = _multi_sections(plots, agg)
+    workloads = workload_matrix(args.runs)
+
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(templates_path))
+    template = env.get_template("upcie_iommu_overhead_multi.jinja2.rst")
+    body_path.write_text(template.render({
+        "title": args.report_title,
+        "subtitle": args.report_subtitle,
+        "rows": agg,
+        "plots": plots,
+        "workloads": workloads,
+        "sections": sections,
+        "per_device": _multi_per_device_groups(per_dev),
+        "tail_latencies": TAIL_LATENCIES,
+    }))
+    err, _ = cijoe.run_local(
+        f"rst2pdf {shlex.quote(str(body_path))}"
+        f" -b1"
+        f" --custom-cover {shlex.quote(str(cover_path))}"
+        f" -s {shlex.quote(str(style_path))}"
+        f" -o {shlex.quote(str(pdf_path))}"
+    )
+    return err
+
+
 def main(args, cijoe):
     try:
         templates_path = args.templates.resolve()
@@ -166,6 +317,12 @@ def main(args, cijoe):
         copy_graphs(report_path, artifacts)
 
         comparison = load_comparison(search_path)
+        if _is_multi(comparison):
+            return _render_multi(
+                args, cijoe, comparison, search_path, artifacts,
+                templates_path, report_path, style_path, cover_path,
+            )
+
         rows = format_items(comparison["items"])
         plots = plot_groups(artifacts)
         workloads = workload_matrix(args.runs)
