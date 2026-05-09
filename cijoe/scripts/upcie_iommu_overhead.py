@@ -93,6 +93,68 @@ def cpumask_to_cpu_count(cpumask):
     return len(cpumask_to_cpu_list(cpumask).split(","))
 
 
+def bdf_safe(bdf):
+    """Filename-safe form of a PCI BDF (replaces ':' and '.' with '_')."""
+    return str(bdf).replace(":", "_").replace(".", "_")
+
+
+def resolve_devices(cijoe, runs):
+    """Multi-device opt-in. Returns [{bdf, nsid, cpumask}, ...] when the
+    config sets `upcie_iommu_overhead.devices`, otherwise None (the legacy
+    single-device path stays in effect).
+
+    Each device pins to one CPU (single-bit cpumask is enforced).
+    """
+    devices = conf(cijoe, "devices")
+    if not devices:
+        return None
+
+    global_nsid = int(conf(cijoe, "nsid", 1))
+    global_cpumask = runconf(runs, "cpumask")
+
+    resolved = []
+    for entry in devices:
+        if not isinstance(entry, dict) or "bdf" not in entry:
+            raise ValueError(
+                f"upcie_iommu_overhead.devices entry missing 'bdf': {entry!r}"
+            )
+        cpumask = entry.get("cpumask", global_cpumask)
+        if cpumask_to_cpu_count(cpumask) != 1:
+            raise ValueError(
+                f"upcie_iommu_overhead device {entry['bdf']}: "
+                f"cpumask={cpumask!r} must have exactly 1 bit set "
+                f"(use one entry per CPU)"
+            )
+        resolved.append({
+            "bdf": entry["bdf"],
+            "nsid": int(entry.get("nsid", global_nsid)),
+            "cpumask": cpumask,
+        })
+    return resolved
+
+
+def resolve_device_counts(runs, n_devices):
+    """`device_counts` sweep for the multi-device path. Defaults to
+    [n_devices]; each value selects a prefix of `devices`.
+    """
+    counts = runs.get("device_counts")
+    if counts is None:
+        return [n_devices]
+    if not isinstance(counts, list) or not counts:
+        raise ValueError(
+            f"device_counts must be a non-empty list, got: {counts!r}"
+        )
+    out = []
+    for v in counts:
+        n = int(v)
+        if n < 1 or n > n_devices:
+            raise ValueError(
+                f"device_counts entry {n} out of range [1, {n_devices}]"
+            )
+        out.append(n)
+    return out
+
+
 def resolve_bin(cijoe, name, default):
     path = Path(conf(cijoe, f"bins.{name}", str(repo_path(cijoe) / default)))
     if path.is_dir():
@@ -248,6 +310,45 @@ def fio_cmd(cijoe, runs, fio_bin, device, nsid, pattern, iosize, iodepth):
     )
 
 
+def fio_cmd_multi(cijoe, runs, fio_bin, devices_subset, pattern, iosize, iodepth):
+    """Multi-device fio invocation: one --name=devN job per device,
+    --numjobs=1, --group_reporting=1. Each device pins to its own CPU
+    (single-bit cpumask).
+    """
+    runtime = int(runconf(runs, "runtime"))
+    ramp_time = int(runconf(runs, "fio_ramp_time"))
+    size = runconf(runs, "fio_size")
+
+    parts = [
+        f"sudo {q(fio_bin)}",
+        "--ioengine=xnvme",
+        "--xnvme_be=upcie",
+        "--thread=1",
+        "--direct=1",
+        f"--rw={q(pattern)}",
+        f"--size={q(size)}",
+        f"--bs={q(iosize)}",
+        f"--iodepth={q(iodepth)}",
+        "--time_based=1",
+        f"--runtime={q(runtime)}",
+        f"--ramp_time={q(ramp_time)}",
+        "--norandommap=1",
+        "--group_reporting=1",
+        "--output-format=json",
+        f"--percentile_list={FIO_PERCENTILE_LIST}",
+    ]
+    for idx, dev in enumerate(devices_subset):
+        fio_device = str(dev["bdf"]).replace(":", r"\:")
+        parts.extend([
+            f"--name=dev{idx}",
+            f"--filename={q(fio_device)}",
+            f"--xnvme_dev_nsid={q(dev['nsid'])}",
+            "--numjobs=1",
+            f"--cpus_allowed={q(cpumask_to_cpu_list(dev['cpumask']))}",
+        ])
+    return " ".join(parts)
+
+
 def write_metadata(artifacts, runs, driver, device, nsid, runs_path):
     meta_path = artifacts / "upcie-iommu-overhead-meta.txt"
     cpumask = runconf(runs, "cpumask")
@@ -288,16 +389,195 @@ def prune_artifacts(artifacts):
         normalized.unlink()
 
 
+def _write_multi_metadata(artifacts, runs, driver, devices, device_counts, runs_path):
+    meta_path = artifacts / "upcie-iommu-overhead-meta.txt"
+    devices_repr = ";".join(
+        f"{d['bdf']}:nsid={d['nsid']}:cpumask={d['cpumask']}" for d in devices
+    )
+    values = {
+        "driver": driver,
+        "devices": devices_repr,
+        "device_counts": ",".join(str(n) for n in device_counts),
+        "runners": "fio (+xnvmeperf for N=1)",
+        "runtime": runconf(runs, "runtime"),
+        "repeat": runconf(runs, "repeat"),
+        "fio_ramp_time": runconf(runs, "fio_ramp_time"),
+        "fio_size": runconf(runs, "fio_size"),
+        "workload_pause": runconf(runs, "workload_pause"),
+        "runs": runs_path,
+    }
+    with meta_path.open("w") as meta:
+        for key, value in values.items():
+            meta.write(f"{key}={value}\n")
+
+
+def _main_multi(args, cijoe, runs):
+    """Multi-device variant of `main()`. Driven by the optional
+    `upcie_iommu_overhead.devices = [...]` config key.
+
+    For each (workload case, N in device_counts, rep): fio is run as a
+    single process with one --name=devN job per device. Single-device cases
+    (N=1) additionally run xnvmeperf as a throughput cross-check (matching
+    the legacy single-device behaviour).
+    """
+    driver = conf(cijoe, "driver")
+    huge_mem = conf(cijoe, "huge_mem", None)
+    repeat = int(runconf(runs, "repeat"))
+    workload_pause = int(runconf(runs, "workload_pause"))
+
+    if not driver:
+        log.error("Missing upcie_iommu_overhead.driver")
+        return errno.EINVAL
+
+    devices = resolve_devices(cijoe, runs)
+    if not devices:
+        log.error("Missing upcie_iommu_overhead.devices")
+        return errno.EINVAL
+    device_counts = resolve_device_counts(runs, len(devices))
+    log.info(
+        f"multi-device: {len(devices)} device(s); "
+        f"device_counts sweep = {device_counts}"
+    )
+
+    xnvme_bin = resolve_bin(cijoe, "xnvme", "builddir/tools/xnvme")
+    xnvmeperf_bin = resolve_bin(
+        cijoe, "xnvmeperf", "builddir/tools/xnvmeperf/xnvmeperf"
+    )
+    fio_bin = conf(cijoe, "bins.fio", cijoe.getconf("fio.bin", "fio"))
+    driver_script = resolve_bin(cijoe, "driver_script", "toolbox/xnvme-driver.sh")
+
+    err = 0
+    driver_configured = False
+    cases = list(workload_cases(runs))
+    all_bdfs_str = " ".join(d["bdf"] for d in devices)
+
+    try:
+        err, dmesg = check_iommu_state(cijoe, driver)
+        if err:
+            return err
+
+        artifacts = Path(args.output) / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        prune_artifacts(artifacts)
+        _write_multi_metadata(
+            artifacts, runs, driver, devices, device_counts, args.runs
+        )
+        write_dmesg_artifact(artifacts, driver, dmesg)
+
+        # Bind every declared device once.
+        err = configure_driver(cijoe, driver_script, driver, all_bdfs_str, huge_mem)
+        if err:
+            return err
+        driver_configured = True
+
+        for dev in devices:
+            info_path = artifacts / (
+                f"xnvme-info_DEV={bdf_safe(dev['bdf'])}_"
+                f"LABEL={driver}_GROUP={GROUP}.txt"
+            )
+            err = capture_device_info(
+                cijoe, xnvme_bin, dev["bdf"], dev["nsid"], info_path
+            )
+            if err:
+                return err
+
+        cases_x_n = list(product(cases, device_counts))
+        runs_per_iter = sum(2 if n == 1 else 1 for _, n in cases_x_n)
+        combinations = runs_per_iter * repeat
+        completed = 0
+        print(
+            "run:",
+            "{",
+            f"'driver': '{driver}'",
+            f"'devices': {len(devices)}",
+            f"'device_counts': {device_counts}",
+            f"'workloads': {len(cases)}",
+            f"'repeat': {repeat}",
+            "}",
+        )
+        print_progress(f"0% completed (0/{combinations})")
+
+        for outer_idx, ((pattern, iosize, iodepth), n) in enumerate(
+            cases_x_n, start=1
+        ):
+            subset = devices[:n]
+            for rep in range(1, repeat + 1):
+                workload = (
+                    f"RW={pattern} IOSIZE={iosize} "
+                    f"IODEPTH={iodepth} N={n} REP={rep}/{repeat}"
+                )
+
+                # xnvmeperf cross-check (single-device only)
+                if n == 1:
+                    dev = subset[0]
+                    xnvmeperf_path = artifacts / (
+                        f"xnvmeperf-output_DEV={bdf_safe(dev['bdf'])}_DEVCOUNT={n}_"
+                        f"IOSIZE={iosize}_IODEPTH={iodepth}_"
+                        f"LABEL={driver}_GROUP={GROUP}_RW={pattern}_REP={rep}.txt"
+                    )
+                    print_progress(
+                        f"{completed / combinations * 100:.0f}% completed "
+                        f"({completed}/{combinations}); running xnvmeperf {workload}"
+                    )
+                    cmd = xnvmeperf_cmd(
+                        cijoe, runs, xnvmeperf_bin, dev["bdf"],
+                        pattern, iosize, iodepth,
+                    )
+                    err = run_and_copy(cijoe, cmd, xnvmeperf_path)
+                    if err:
+                        return err
+                    completed += 1
+
+                print_progress(
+                    f"{completed / combinations * 100:.0f}% completed "
+                    f"({completed}/{combinations}); running fio {workload}"
+                )
+                fio_path = artifacts / (
+                    f"fio-output_DEVCOUNT={n}_"
+                    f"IOSIZE={iosize}_IODEPTH={iodepth}_"
+                    f"LABEL={driver}_GROUP={GROUP}_RW={pattern}_REP={rep}.txt"
+                )
+                cmd = fio_cmd_multi(
+                    cijoe, runs, fio_bin, subset, pattern, iosize, iodepth
+                )
+                err = run_and_copy(cijoe, cmd, fio_path)
+                if err:
+                    return err
+                completed += 1
+                print_progress(
+                    f"{completed / combinations * 100:.0f}% completed "
+                    f"({completed}/{combinations}); finished fio {workload}"
+                )
+
+            if workload_pause > 0 and outer_idx < len(cases_x_n):
+                time.sleep(workload_pause)
+
+        print(f"100% completed ({completed}/{combinations})", flush=True)
+
+    except Exception as exc:
+        log.error(f"Something failed({exc})")
+        log.error("".join(traceback.format_exception(None, exc, exc.__traceback__)))
+        return 1
+    finally:
+        if driver_configured:
+            reset_driver(cijoe, driver_script, all_bdfs_str)
+
+    return err
+
+
 def main(args, cijoe):
     if not args.runs:
         log.error("Missing path to auxiliary file describing the runs")
         return errno.EINVAL
 
+    runs = dict_from_yamlfile(args.runs)
+    if conf(cijoe, "devices"):
+        return _main_multi(args, cijoe, runs)
+
     driver = conf(cijoe, "driver")
     device = conf(cijoe, "device")
     nsid = int(conf(cijoe, "nsid", 1))
     huge_mem = conf(cijoe, "huge_mem", None)
-    runs = dict_from_yamlfile(args.runs)
     repeat = int(runconf(runs, "repeat"))
     workload_pause = int(runconf(runs, "workload_pause"))
 

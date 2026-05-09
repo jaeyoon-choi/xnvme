@@ -6,6 +6,11 @@ fio_ramp_time: 5
 fio_size: "100%"
 workload_pause: 5
 
+# Multi-device mode only. Number of devices to run concurrently per workload
+# case. Defaults to [len(devices)]. Each value picks a prefix of the
+# `devices` list declared in the config.
+# device_counts: [1, 2]
+
 workloads:
 - pattern: randread
   iosizes: [4096]

@@ -1,0 +1,15 @@
+# Multi-device variant of upcie-iommu-overhead-vfio.toml. Picking this
+# config selects the multi-device bench/report path automatically; the
+# original single-device config is unaffected.
+[upcie_iommu_overhead]
+driver = "vfio-pci"
+# Default namespace ID; per-device entry below may override.
+nsid = 1
+
+# List of NVMe devices to drive concurrently. Each entry must pin to a
+# distinct CPU (single-bit `cpumask`). The runs file may add
+# `device_counts` to sweep N over a prefix of this list.
+devices = [
+    { bdf = "0000:02:00.0", cpumask = "0x1" },
+    { bdf = "0000:03:00.0", cpumask = "0x2" },
+]

@@ -20,6 +20,10 @@ doc: |
         --output cijoe-output-upcie-uio
         workflows/benchmark-upcie-iommu-overhead.yaml
 
+  Multi-device variants pick the corresponding `*-multi.toml` config; the
+  bench step auto-detects the multi-device path from the `devices` key.
+  Example: configs/upcie-iommu-overhead-vfio-multi.toml
+
 steps:
 - name: sysinfo_report
   uses: sysinfo_report
