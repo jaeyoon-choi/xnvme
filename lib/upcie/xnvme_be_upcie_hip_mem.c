@@ -60,6 +60,13 @@ int
 xnvme_be_upcie_hip_mem_map(const struct xnvme_dev *dev, void *vaddr, size_t nbytes, uint64_t *phys)
 {
 	const struct xnvme_be_upcie_state *state = (void *)dev->be.state;
+	int err;
+
+	/* The registry resolves the range with hipMemGetAddressRange(). */
+	err = xnvme_be_upcie_hip_dev_bind();
+	if (err) {
+		return err;
+	}
 
 	return xnvme_be_upcie_dmamem_map(state->dmem, vaddr, nbytes, phys);
 }

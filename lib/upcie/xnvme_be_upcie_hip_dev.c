@@ -6,34 +6,84 @@
 #include <xnvme_be.h>
 #include <xnvme_be_nosys.h>
 #ifdef XNVME_BE_UPCIE_HIP_ENABLED
-#include <stdatomic.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <xnvme_dev.h>
 #include <xnvme_be_upcie_hip.h>
 
-static _Atomic int g_hip_ctrlr_count;
+/** Serializes bring-up/tear-down of the shared HIP runtime (g_upcie_hip_rte) */
+static pthread_mutex_t g_hip_rte_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void
-_hip_rte_term(void)
-{
-	if (!g_upcie_hip_rte.is_initialized) {
-		return;
-	}
-
-	dmamem_destroy(&g_upcie_hip_rte.dmem);
-	hipmem_heap_term(&g_upcie_hip_rte.hip_heap);
-
-	g_upcie_hip_rte.is_initialized = 0;
-}
+/** HIP RTE references held by open devices; only read or written under g_hip_rte_lock */
+static int g_hip_ctrlr_count;
 
 static int
-_hip_rte_init(size_t heap_size, uint32_t gpu_id)
+_hip_rte_init_locked(size_t heap_size, uint32_t gpu_id);
+
+/** Drop a reference taken by _hip_rte_get(); the last one tears the runtime down */
+static void
+_hip_rte_put(void)
+{
+	pthread_mutex_lock(&g_hip_rte_lock);
+
+	if ((--g_hip_ctrlr_count == 0) && g_upcie_hip_rte.is_initialized) {
+		/* The hipFree inside the heap teardown needs the device too, and the
+		 * thread closing the last device need not be the one that opened it. */
+		xnvme_be_upcie_hip_dev_bind();
+
+		dmamem_destroy(&g_upcie_hip_rte.dmem);
+		hipmem_heap_term(&g_upcie_hip_rte.hip_heap);
+
+		g_upcie_hip_rte.is_initialized = 0;
+	}
+
+	pthread_mutex_unlock(&g_hip_rte_lock);
+}
+
+/** Bring the shared HIP runtime up, or join one already up, and take a reference */
+static int
+_hip_rte_get(size_t heap_size, uint32_t gpu_id)
 {
 	int err;
 
+	pthread_mutex_lock(&g_hip_rte_lock);
+
 	if (g_upcie_hip_rte.is_initialized) {
+		err = 0;
+	} else {
+		err = _hip_rte_init_locked(heap_size, gpu_id);
+	}
+
+	if (!err) {
+		g_hip_ctrlr_count++;
+	}
+
+	pthread_mutex_unlock(&g_hip_rte_lock);
+
+	return err;
+}
+
+int
+xnvme_be_upcie_hip_dev_bind(void)
+{
+	int cur = -1;
+
+	if ((hipGetDevice(&cur) == hipSuccess) && (cur == g_upcie_hip_rte.gpu_id)) {
 		return 0;
 	}
+
+	if (hipSetDevice(g_upcie_hip_rte.gpu_id) != hipSuccess) {
+		XNVME_DEBUG("FAILED: hipSetDevice(%d)", g_upcie_hip_rte.gpu_id);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int
+_hip_rte_init_locked(size_t heap_size, uint32_t gpu_id)
+{
+	int err;
 
 	if (!heap_size) {
 		heap_size = XNVME_BE_UPCIE_DEFAULT_HEAP_SIZE;
@@ -45,10 +95,11 @@ _hip_rte_init(size_t heap_size, uint32_t gpu_id)
 		return -ENODEV;
 	}
 
-	err = hipSetDevice(gpu_id);
+	g_upcie_hip_rte.gpu_id = (int)gpu_id;
+
+	err = xnvme_be_upcie_hip_dev_bind();
 	if (err) {
-		XNVME_DEBUG("FAILED: hipSetDevice(); err(%d)", err);
-		return -ENODEV;
+		return err;
 	}
 
 	err = hipmem_config_init(&g_upcie_hip_rte.hip_config, 0);
@@ -186,9 +237,17 @@ xnvme_be_upcie_hip_dev_open(struct xnvme_dev *dev)
 		return err;
 	}
 
-	err = _hip_rte_init(dev->opts.device_heap_size, dev->opts.gpu_id);
+	err = _hip_rte_get(dev->opts.device_heap_size, dev->opts.gpu_id);
 	if (err) {
-		XNVME_DEBUG("FAILED: _hip_rte_init(); err(%d)", err);
+		XNVME_DEBUG("FAILED: _hip_rte_get(); err(%d)", err);
+		return err;
+	}
+
+	/* Everything below, and every later hip*() this thread makes through the
+	 * backend, resolves against the device bound here. */
+	err = xnvme_be_upcie_hip_dev_bind();
+	if (err) {
+		_hip_rte_put();
 		return err;
 	}
 
@@ -197,13 +256,10 @@ xnvme_be_upcie_hip_dev_open(struct xnvme_dev *dev)
 	err = _hip_dev_dmem_init(dev);
 	if (err) {
 		XNVME_DEBUG("FAILED: _hip_dev_dmem_init(); err(%d)", err);
-		if (!atomic_load(&g_hip_ctrlr_count)) {
-			_hip_rte_term();
-		}
+		_hip_rte_put();
 		return err;
 	}
 
-	atomic_fetch_add(&g_hip_ctrlr_count, 1);
 	return 0;
 }
 
@@ -212,9 +268,7 @@ xnvme_be_upcie_hip_dev_close(struct xnvme_dev *dev)
 {
 	_hip_dev_dmem_term(dev);
 
-	if (atomic_fetch_sub(&g_hip_ctrlr_count, 1) == 1) {
-		_hip_rte_term();
-	}
+	_hip_rte_put();
 	xnvme_be_upcie_dev_close(dev);
 }
 

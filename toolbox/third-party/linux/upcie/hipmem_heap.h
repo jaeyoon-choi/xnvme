@@ -25,6 +25,8 @@
  * @version 0.8.0
  */
 
+#include <pthread.h>
+
 /**
  * A block in the freelist
  *
@@ -50,6 +52,7 @@ struct hipmem_heap {
 	size_t size;				///< Size of the heap
 	size_t nphys;				///< Number of device pages backing 'memory' (size / config->device_pagesize)
 	uint64_t *phys_lut;			///< An array of physical addresses; one for each device page in 'memory'
+	pthread_mutex_t lock;			///< Serializes freelist mutation across threads
 };
 
 /**
@@ -67,6 +70,8 @@ hipmem_heap_pp(struct hipmem_heap *heap)
 		return 0;
 	}
 
+	pthread_mutex_lock(&heap->lock);
+
 	wrtn += printf("\n");
 
 	wrtn += printf("  size: '%zu'\n", heap->size);
@@ -82,6 +87,8 @@ hipmem_heap_pp(struct hipmem_heap *heap)
 	for (struct hipmem_heap_block *block = heap->freelist; block; block = block->next) {
 		wrtn += printf("  - {vaddr: 0x%" PRIx64 ", size: %zu, free: %d}\n", block->vaddr, block->size, block->free);
 	}
+
+	pthread_mutex_unlock(&heap->lock);
 
 	return wrtn;
 }
@@ -103,6 +110,10 @@ hipmem_heap_empty_freelist(struct hipmem_heap_block *block)
 
 /**
  * Terminate the given heap, freeing the underlying memory and emptying the freelist
+ *
+ * The caller must have quiesced the heap first. Holding the lock here would not
+ * make a concurrent alloc safe, since the destroy below pulls the heap out from
+ * under whoever was waiting on it.
  */
 static inline void
 hipmem_heap_term(struct hipmem_heap *heap)
@@ -115,6 +126,10 @@ hipmem_heap_term(struct hipmem_heap *heap)
 	hipmem_heap_empty_freelist(heap->freelist);
 	free(heap->phys_lut);
 	hipFree((void *)heap->vaddr);
+
+	pthread_mutex_destroy(&heap->lock);
+
+	memset(heap, 0, sizeof(*heap));
 }
 
 
@@ -147,6 +162,7 @@ hipmem_heap_init(struct hipmem_heap *heap, size_t size, struct hipmem_config *co
 
 	memset(heap, 0, sizeof(*heap));
 	heap->config = config;
+	pthread_mutex_init(&heap->lock, NULL);
 
 	err = hipMalloc(&vaddr, size);
 	if (err) {
@@ -208,6 +224,7 @@ error_after_attach:
 	free(heap->freelist);
 	free(heap->phys_lut);
 	hipFree(vaddr);
+	pthread_mutex_destroy(&heap->lock);
 	return err;
 error:
 	free(heap->freelist);
@@ -216,6 +233,7 @@ error:
 		close(dmabuf_fd);
 	}
 	hipFree(vaddr);
+	pthread_mutex_destroy(&heap->lock);
 	return err;
 }
 
@@ -235,6 +253,8 @@ hipmem_heap_block_free(struct hipmem_heap *heap, void *ptr)
 	if (!ptr) {
 		return;
 	}
+
+	pthread_mutex_lock(&heap->lock);
 
 	vaddr = (uint64_t) ptr;
 	block = heap->freelist;
@@ -262,6 +282,8 @@ hipmem_heap_block_free(struct hipmem_heap *heap, void *ptr)
 	if (block && block->vaddr == vaddr) {
 		block->free = 1;
 	}
+
+	pthread_mutex_unlock(&heap->lock);
 }
 
 /**
@@ -278,7 +300,7 @@ static inline void *
 hipmem_heap_block_alloc_array_aligned(struct hipmem_heap *heap, size_t elem_count,
 				       size_t elem_size, size_t alignment)
 {
-	struct hipmem_heap_block *block = heap->freelist;
+	struct hipmem_heap_block *block;
 	size_t total_size;
 
 	if (elem_count > SIZE_MAX / elem_size) {
@@ -301,6 +323,9 @@ hipmem_heap_block_alloc_array_aligned(struct hipmem_heap *heap, size_t elem_coun
 
 	total_size = (total_size + alignment - 1) & ~(alignment - 1);
 
+	pthread_mutex_lock(&heap->lock);
+	block = heap->freelist;
+
 	while (block) {
 		if (block->free && block->size >= total_size) {
 			size_t offset, in_dpage_offset, dpage_remaining, disalignment, remaining;
@@ -316,6 +341,7 @@ hipmem_heap_block_alloc_array_aligned(struct hipmem_heap *heap, size_t elem_coun
 				struct hipmem_heap_block *newblock = malloc(sizeof(struct hipmem_heap_block));
 				if (!newblock) {
 					UPCIE_DEBUG("FAILED: malloc(newblock), errno: %d", errno);
+					pthread_mutex_unlock(&heap->lock);
 					return NULL;
 				}
 
@@ -336,6 +362,7 @@ hipmem_heap_block_alloc_array_aligned(struct hipmem_heap *heap, size_t elem_coun
 				struct hipmem_heap_block *newblock = malloc(sizeof(struct hipmem_heap_block));
 				if (!newblock) {
 					UPCIE_DEBUG("FAILED: malloc(newblock), errno: %d", errno);
+					pthread_mutex_unlock(&heap->lock);
 					return NULL;
 				}
 
@@ -349,12 +376,14 @@ hipmem_heap_block_alloc_array_aligned(struct hipmem_heap *heap, size_t elem_coun
 			}
 
 			block->free = 0;
+			pthread_mutex_unlock(&heap->lock);
 			return (void *)block->vaddr;
 		}
 
 		block = block->next;
 	}
 
+	pthread_mutex_unlock(&heap->lock);
 	errno = ENOMEM;
 	return NULL;
 }
