@@ -9,10 +9,20 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #include <xnvme_dev.h>
 #include <xnvme_be_upcie.h>
 
-static _Atomic int g_ctrlr_count;
+/** Serializes bring-up/tear-down of the process-wide RTE (g_upcie_rte) */
+static pthread_mutex_t g_rte_lock = PTHREAD_MUTEX_INITIALIZER;
+/** Serializes claim/allocation of the shared GPU IOVA window (g_gpu_win) */
+static pthread_mutex_t g_gpu_win_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/** RTE references held by open controllers; only read or written under g_rte_lock */
+static int g_ctrlr_count;
+
+static int
+_rte_init_locked(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts);
 
 /**
  * Address-space width the DMA-address table is sized for
@@ -169,9 +179,11 @@ xnvme_be_upcie_gpu_map_open(struct xnvme_be_upcie_gpu_map *map, const char *bdf,
 		return -ENOTSUP;
 	}
 
+	pthread_mutex_lock(&g_gpu_win_lock);
+
 	err = _gpu_window_claim(bdf, span);
 	if (err) {
-		return err;
+		goto out;
 	}
 
 	for (slice = 0; slice < g_gpu_win.nslices; ++slice) {
@@ -184,7 +196,8 @@ xnvme_be_upcie_gpu_map_open(struct xnvme_be_upcie_gpu_map *map, const char *bdf,
 			    "XNVME_UPCIE_GPU_IOVA_SIZE",
 			    g_gpu_win.nslices);
 		_gpu_window_release();
-		return -ENOSPC;
+		err = -ENOSPC;
+		goto out;
 	}
 
 	err = dmamem_iommu_map_pa_open(
@@ -193,7 +206,7 @@ xnvme_be_upcie_gpu_map_open(struct xnvme_be_upcie_gpu_map *map, const char *bdf,
 		XNVME_DEBUG("FAILED: dmamem_iommu_map_pa_open(%s); err(%d); module loaded?", bdf,
 			    err);
 		_gpu_window_release();
-		return err;
+		goto out;
 	}
 
 	g_gpu_win.used[slice] = 1;
@@ -203,7 +216,9 @@ xnvme_be_upcie_gpu_map_open(struct xnvme_be_upcie_gpu_map *map, const char *bdf,
 	map->slice = slice;
 	snprintf(map->bdf, sizeof(map->bdf), "%s", bdf);
 
-	return 0;
+out:
+	pthread_mutex_unlock(&g_gpu_win_lock);
+	return err;
 }
 
 void
@@ -212,6 +227,8 @@ xnvme_be_upcie_gpu_map_close(struct xnvme_be_upcie_gpu_map *map)
 	if (!map->alive) {
 		return;
 	}
+
+	pthread_mutex_lock(&g_gpu_win_lock);
 
 	dmamem_iommu_map_pa_close(&map->imp);
 
@@ -224,6 +241,8 @@ xnvme_be_upcie_gpu_map_close(struct xnvme_be_upcie_gpu_map *map)
 	map->bdf[0] = '\0';
 
 	_gpu_window_release();
+
+	pthread_mutex_unlock(&g_gpu_win_lock);
 }
 
 /**
@@ -233,7 +252,7 @@ xnvme_be_upcie_gpu_map_close(struct xnvme_be_upcie_gpu_map *map)
  * not initialized, then it exits early.
  */
 static void
-_rte_term(void)
+_rte_term_locked(void)
 {
 	if (!g_upcie_rte.is_initialized) {
 		return;
@@ -271,6 +290,19 @@ _rte_term(void)
 
 	g_upcie_rte.mode = XNVME_BE_UPCIE_MODE_UNSET;
 	g_upcie_rte.is_initialized = 0;
+}
+
+/** Drop a reference taken by _rte_get(); the last one tears the RTE down */
+static void
+_rte_put(void)
+{
+	pthread_mutex_lock(&g_rte_lock);
+
+	if (--g_ctrlr_count == 0) {
+		_rte_term_locked();
+	}
+
+	pthread_mutex_unlock(&g_rte_lock);
 }
 
 /**
@@ -422,21 +454,46 @@ _rte_init_vfio_type1(size_t heap_size)
  * enable multi-process mode; only UIO_LUT supports it because the primary
  * publishes its hugepage for secondaries to import, which the memfd and
  * type1-container paths cannot do.
+ *
+ * Takes a reference on success; release it with _rte_put().
+ *
+ * This does not make xnvme_dev_open() thread-safe. The cref table that calls
+ * ctrlr_init (lib/xnvme_be_cref.c) has no lock, so concurrent opens can still
+ * claim the same slot.
  */
 static int
-_rte_init(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts)
+_rte_get(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts)
 {
-	size_t heap_size = opts->host_heap_size;
 	int err;
+
+	pthread_mutex_lock(&g_rte_lock);
 
 	if (g_upcie_rte.is_initialized) {
 		if (g_upcie_rte.mode != mode) {
 			XNVME_DEBUG("FAILED: existing upcie RTE mode(%d) != requested(%d)",
 				    g_upcie_rte.mode, mode);
-			return -EINVAL;
+			err = -EINVAL;
+		} else {
+			err = 0;
 		}
-		return 0;
+	} else {
+		err = _rte_init_locked(mode, opts);
 	}
+
+	if (!err) {
+		g_ctrlr_count++;
+	}
+
+	pthread_mutex_unlock(&g_rte_lock);
+
+	return err;
+}
+
+static int
+_rte_init_locked(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts)
+{
+	size_t heap_size = opts->host_heap_size;
+	int err;
 
 	if (opts->shm_id && mode != XNVME_BE_UPCIE_MODE_UIO_LUT) {
 		XNVME_DEBUG("FAILED: shm_id requires UIO_LUT (uio_pci_generic); mode(%d)", mode);
@@ -465,7 +522,7 @@ _rte_init(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts)
 	}
 
 	if (err) {
-		_rte_term();
+		_rte_term_locked();
 		return err;
 	}
 
@@ -473,7 +530,7 @@ _rte_init(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts)
 		err = xnvme_be_upcie_mproc_rte_init(opts->shm_id);
 		if (err) {
 			XNVME_DEBUG("FAILED: xnvme_be_upcie_mproc_rte_init(); err(%d)", err);
-			_rte_term();
+			_rte_term_locked();
 			return err;
 		}
 
@@ -496,13 +553,13 @@ _rte_init(enum xnvme_be_upcie_mode mode, struct xnvme_opts *opts)
 			}
 			if (!atomic_load_explicit(&shm->is_initialized, memory_order_acquire)) {
 				XNVME_DEBUG("FAILED: timed out waiting for primary hp publish");
-				_rte_term();
+				_rte_term_locked();
 				return -ENOENT;
 			}
 			err = xnvme_be_upcie_mproc_import_admin_hugepage();
 			if (err) {
 				XNVME_DEBUG("FAILED: mproc_import_admin_hugepage(); err(%d)", err);
-				_rte_term();
+				_rte_term_locked();
 				return err;
 			}
 		}
@@ -628,9 +685,9 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 		return NULL;
 	}
 
-	err = _rte_init(mode, &dev->opts);
+	err = _rte_get(mode, &dev->opts);
 	if (err) {
-		XNVME_DEBUG("FAILED: _rte_init(mode(%d))", mode);
+		XNVME_DEBUG("FAILED: _rte_get(mode(%d))", mode);
 		errno = -err;
 		return NULL;
 	}
@@ -666,7 +723,6 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 			errno = -err;
 			goto failed;
 		}
-		g_ctrlr_count++;
 		return ctrlr;
 	}
 
@@ -741,8 +797,6 @@ xnvme_be_upcie_ctrlr_init(struct xnvme_dev *dev)
 				      memory_order_release);
 	}
 
-	g_ctrlr_count++;
-
 	return ctrlr;
 
 failed:
@@ -755,9 +809,7 @@ failed:
 		free(ctrlr);
 	}
 
-	if (g_ctrlr_count == 0) {
-		_rte_term();
-	}
+	_rte_put();
 
 	return NULL;
 }
@@ -792,9 +844,7 @@ xnvme_be_upcie_ctrlr_term(void *handle)
 	}
 	free(ctrlr);
 
-	if (--g_ctrlr_count == 0) {
-		_rte_term();
-	}
+	_rte_put();
 
 	return 0;
 }
