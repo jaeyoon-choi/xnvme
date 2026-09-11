@@ -35,6 +35,31 @@ REPOS/toolbox/xnvme-driver.sh
   Repos: https://github.com/spdk/spdk
   Website: https://spdk.io/
 
+REPOS/toolbox/third-party/linux/upcie/
+  Summary: Header-only library providing the user-space PCIe, IOMMU and NVMe
+  primitives that the ``be/upcie`` backend is built on, along with the CUDA
+  and HIP device-memory heaps its GPU variants allocate from. It is vendored
+  as a plain copy of a release, not a submodule, and refreshed wholesale by
+  commits titled ``chore(upcie): vendor uPCIe vX.Y.Z``.
+
+  License: BSD-3-Clause
+
+  Repos: https://github.com/safl/upcie
+  Website: https://github.com/safl/upcie
+
+  Local changes: the copy in this tree is NOT pristine. The freelists in
+  ``dmamem_heap.h``, ``cudamem_heap.h`` and ``hipmem_heap.h`` carry a
+  per-heap mutex that upstream does not have, because xNVMe allocates from
+  several threads at once. A refresh overwrites the directory and drops
+  those. Before refreshing, capture the delta against the commit that
+  vendored the current release::
+
+    git log --oneline -- toolbox/third-party/linux/upcie/   # find the last "vendor uPCIe" commit
+    git diff <that-commit> -- toolbox/third-party/linux/upcie/ > upcie-local.patch
+
+  then drop in the new release and re-apply. Sending the change upstream is
+  the better fix, since then the next refresh carries it for free.
+
 SYSTEM:freebsd:/
   Summary: Headers for the FreeBSD Kernel NVMe driver IOCTLs are used by the
   ``be/fbsd``, then headers for backend. These headers are not distributed with
