@@ -15,6 +15,11 @@ xnvme_cuda_queue_create(struct xnvme_dev *dev, uint16_t depth, struct xnvme_cuda
 	struct xnvme_cuda_queue *qpair;
 	int err;
 
+	err = xnvme_be_upcie_cuda_ctx_bind();
+	if (err) {
+		return err;
+	}
+
 	err = cuMemAlloc((CUdeviceptr *)&qpair, sizeof(struct xnvme_cuda_queue));
 	if (err) {
 		XNVME_DEBUG("FAILED: cuMemAlloc(qpair); CUresult(%d)", err);
@@ -52,6 +57,10 @@ xnvme_cuda_queue_destroy(struct xnvme_dev *dev, struct xnvme_cuda_queue *queue)
 {
 	struct xnvme_be_upcie_state *state = (void *)dev->be.state;
 	int err;
+
+	/* Carry on when the bind fails: leaking the cuMemFree below beats leaving
+	 * the device-side queue behind. */
+	xnvme_be_upcie_cuda_ctx_bind();
 
 	err = xnvme_be_upcie_mproc_qids_lock(state->ctrlr);
 	if (err) {

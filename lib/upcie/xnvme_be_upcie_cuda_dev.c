@@ -6,36 +6,87 @@
 #include <xnvme_be.h>
 #include <xnvme_be_nosys.h>
 #ifdef XNVME_BE_UPCIE_CUDA_ENABLED
-#include <stdatomic.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <xnvme_dev.h>
 #include <xnvme_be_upcie_cuda.h>
 
-static _Atomic int g_cuda_ctrlr_count;
+/** Serializes bring-up/tear-down of the shared CUDA runtime (g_upcie_cuda_rte) */
+static pthread_mutex_t g_cuda_rte_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/** CUDA RTE references held by open devices; only read or written under g_cuda_rte_lock */
+static int g_cuda_ctrlr_count;
+
+static int
+_cuda_rte_init_locked(size_t heap_size, uint32_t gpu_id);
+
+/** Drop a reference taken by _cuda_rte_get(); the last one tears the runtime down */
 static void
-_cuda_rte_term(void)
+_cuda_rte_put(void)
 {
-	if (!g_upcie_cuda_rte.is_initialized) {
-		return;
+	pthread_mutex_lock(&g_cuda_rte_lock);
+
+	if ((--g_cuda_ctrlr_count == 0) && g_upcie_cuda_rte.is_initialized) {
+		/* The cuMemFree inside the heap teardown needs the context too, and the
+		 * thread closing the last device need not be the one that opened it. */
+		xnvme_be_upcie_cuda_ctx_bind();
+
+		dmamem_destroy(&g_upcie_cuda_rte.dmem);
+		cudamem_heap_term(&g_upcie_cuda_rte.cuda_heap);
+		cuDevicePrimaryCtxRelease(g_upcie_cuda_rte.cu_dev);
+
+		g_upcie_cuda_rte.cu_ctx = NULL;
+		g_upcie_cuda_rte.is_initialized = 0;
 	}
 
-	dmamem_destroy(&g_upcie_cuda_rte.dmem);
-	cudamem_heap_term(&g_upcie_cuda_rte.cuda_heap);
-	cuCtxDestroy(g_upcie_cuda_rte.cu_ctx);
+	pthread_mutex_unlock(&g_cuda_rte_lock);
+}
 
-	g_upcie_cuda_rte.is_initialized = 0;
+/** Bring the shared CUDA runtime up, or join one already up, and take a reference */
+static int
+_cuda_rte_get(size_t heap_size, uint32_t gpu_id)
+{
+	int err;
+
+	pthread_mutex_lock(&g_cuda_rte_lock);
+
+	if (g_upcie_cuda_rte.is_initialized) {
+		err = 0;
+	} else {
+		err = _cuda_rte_init_locked(heap_size, gpu_id);
+	}
+
+	if (!err) {
+		g_cuda_ctrlr_count++;
+	}
+
+	pthread_mutex_unlock(&g_cuda_rte_lock);
+
+	return err;
+}
+
+int
+xnvme_be_upcie_cuda_ctx_bind(void)
+{
+	CUcontext cur = NULL;
+
+	if ((cuCtxGetCurrent(&cur) == CUDA_SUCCESS) && (cur == g_upcie_cuda_rte.cu_ctx)) {
+		return 0;
+	}
+
+	if (cuCtxSetCurrent(g_upcie_cuda_rte.cu_ctx) != CUDA_SUCCESS) {
+		XNVME_DEBUG("FAILED: cuCtxSetCurrent()");
+		return -EIO;
+	}
+
+	return 0;
 }
 
 static int
-_cuda_rte_init(size_t heap_size, uint32_t gpu_id)
+_cuda_rte_init_locked(size_t heap_size, uint32_t gpu_id)
 {
 	CUdevice cu_dev;
 	int err;
-
-	if (g_upcie_cuda_rte.is_initialized) {
-		return 0;
-	}
 
 	if (!heap_size) {
 		heap_size = XNVME_BE_UPCIE_DEFAULT_HEAP_SIZE;
@@ -53,21 +104,27 @@ _cuda_rte_init(size_t heap_size, uint32_t gpu_id)
 		return -ENODEV;
 	}
 
-	// CUDA 13 redefines cuCtxCreate -> cuCtxCreate_v4, which takes an extra
-	// CUctxCreateParams* (NULL = the old default); CUDA 12 keeps the 3-arg form.
-#if CUDA_VERSION >= 13000
-	err = cuCtxCreate(&g_upcie_cuda_rte.cu_ctx, NULL, 0, cu_dev);
-#else
-	err = cuCtxCreate(&g_upcie_cuda_rte.cu_ctx, 0, cu_dev);
-#endif
+	/* The primary context is the one the CUDA runtime API binds, so making it
+	 * current on a caller's thread does not displace the context that caller
+	 * already works in. A private cuCtxCreate() context would. */
+	err = cuDevicePrimaryCtxRetain(&g_upcie_cuda_rte.cu_ctx, cu_dev);
 	if (err) {
-		XNVME_DEBUG("FAILED: cuCtxCreate(); err(%d)", err);
+		XNVME_DEBUG("FAILED: cuDevicePrimaryCtxRetain(); err(%d)", err);
 		return -EIO;
 	}
+	g_upcie_cuda_rte.cu_dev = cu_dev;
+
+	/* Retaining does not make it current; the allocations below need it. */
+	err = xnvme_be_upcie_cuda_ctx_bind();
+	if (err) {
+		cuDevicePrimaryCtxRelease(cu_dev);
+		return err;
+	}
+
 	err = cudamem_config_init(&g_upcie_cuda_rte.cuda_config, 0);
 	if (err) {
 		XNVME_DEBUG("FAILED: cudamem_config_init(); err(%d)", err);
-		cuCtxDestroy(g_upcie_cuda_rte.cu_ctx);
+		cuDevicePrimaryCtxRelease(cu_dev);
 		return err;
 	}
 
@@ -80,7 +137,7 @@ _cuda_rte_init(size_t heap_size, uint32_t gpu_id)
 				&g_upcie_cuda_rte.cuda_config);
 	if (err) {
 		XNVME_DEBUG("FAILED: cudamem_heap_init(); err(%d)", err);
-		cuCtxDestroy(g_upcie_cuda_rte.cu_ctx);
+		cuDevicePrimaryCtxRelease(cu_dev);
 		return -ENOMEM;
 	}
 
@@ -93,7 +150,7 @@ _cuda_rte_init(size_t heap_size, uint32_t gpu_id)
 		if (err) {
 			XNVME_DEBUG("FAILED: dmamem_from_cuda_registry(); err(%d)", err);
 			cudamem_heap_term(&g_upcie_cuda_rte.cuda_heap);
-			cuCtxDestroy(g_upcie_cuda_rte.cu_ctx);
+			cuDevicePrimaryCtxRelease(cu_dev);
 			return err;
 		}
 	}
@@ -202,9 +259,17 @@ xnvme_be_upcie_cuda_dev_open(struct xnvme_dev *dev)
 		return err;
 	}
 
-	err = _cuda_rte_init(dev->opts.device_heap_size, dev->opts.gpu_id);
+	err = _cuda_rte_get(dev->opts.device_heap_size, dev->opts.gpu_id);
 	if (err) {
-		XNVME_DEBUG("FAILED: _cuda_rte_init(); err(%d)", err);
+		XNVME_DEBUG("FAILED: _cuda_rte_get(); err(%d)", err);
+		return err;
+	}
+
+	/* Everything below, and every later cu*() this thread makes through the
+	 * backend, resolves against the context bound here. */
+	err = xnvme_be_upcie_cuda_ctx_bind();
+	if (err) {
+		_cuda_rte_put();
 		return err;
 	}
 
@@ -213,13 +278,10 @@ xnvme_be_upcie_cuda_dev_open(struct xnvme_dev *dev)
 	err = _cuda_dev_dmem_init(dev);
 	if (err) {
 		XNVME_DEBUG("FAILED: _cuda_dev_dmem_init(); err(%d)", err);
-		if (!atomic_load(&g_cuda_ctrlr_count)) {
-			_cuda_rte_term();
-		}
+		_cuda_rte_put();
 		return err;
 	}
 
-	atomic_fetch_add(&g_cuda_ctrlr_count, 1);
 	return 0;
 }
 
@@ -228,9 +290,7 @@ xnvme_be_upcie_cuda_dev_close(struct xnvme_dev *dev)
 {
 	_cuda_dev_dmem_term(dev);
 
-	if (atomic_fetch_sub(&g_cuda_ctrlr_count, 1) == 1) {
-		_cuda_rte_term();
-	}
+	_cuda_rte_put();
 	xnvme_be_upcie_dev_close(dev);
 }
 
