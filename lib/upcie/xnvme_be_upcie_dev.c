@@ -448,6 +448,72 @@ _rte_init_vfio_type1(size_t heap_size)
 	return 0;
 }
 
+/** The guard is heap_alive, not iommu_set, so a part-way failure can be retried */
+static int
+_rte_type1_complete_locked(void)
+{
+	int api_version = 0;
+	int err;
+
+	if (!g_upcie_rte.type1.iommu_set) {
+		err = vfio_get_api_version(&g_upcie_rte.type1.container, &api_version);
+		if (err) {
+			XNVME_DEBUG("FAILED: vfio_get_api_version(); err(%d)", err);
+			return err;
+		}
+		if (api_version != VFIO_API_VERSION) {
+			XNVME_DEBUG("FAILED: unexpected VFIO_API_VERSION(%d != %d)", api_version,
+				    VFIO_API_VERSION);
+			return -EINVAL;
+		}
+
+		if (!vfio_check_extension(&g_upcie_rte.type1.container, VFIO_TYPE1_IOMMU)) {
+			XNVME_DEBUG("FAILED: VFIO_TYPE1_IOMMU extension not supported");
+			return -ENOTSUP;
+		}
+
+		err = vfio_set_iommu(&g_upcie_rte.type1.container, VFIO_TYPE1_IOMMU);
+		if (err < 0) {
+			XNVME_DEBUG("FAILED: vfio_set_iommu(TYPE1); errno(%d)", errno);
+			return -errno;
+		}
+		g_upcie_rte.type1.iommu_set = 1;
+	}
+
+	/* MAP_DMA the whole hugepage at a caller-chosen base_iova; the
+	 * dmamem sits on that mapping as ARITHMETIC (base_iova + offset). */
+	err = dmamem_from_hostmem_type1(&g_upcie_rte.mem.dmem, &g_upcie_rte.type1.container,
+					(uint64_t)0, &g_upcie_rte.mem.hp);
+	if (err) {
+		XNVME_DEBUG("FAILED: dmamem_from_hostmem_type1(); err(%d)", err);
+		return err;
+	}
+	g_upcie_rte.mem.dmem_alive = 1;
+
+	err = dmamem_heap_init(&g_upcie_rte.mem.heap, &g_upcie_rte.mem.dmem, 4096);
+	if (err) {
+		XNVME_DEBUG("FAILED: dmamem_heap_init(); err(%d)", err);
+		dmamem_destroy(&g_upcie_rte.mem.dmem);
+		g_upcie_rte.mem.dmem_alive = 0;
+		return err;
+	}
+	g_upcie_rte.mem.heap_alive = 1;
+
+	return 0;
+}
+
+int
+xnvme_be_upcie_type1_rte_complete(void)
+{
+	int err;
+
+	pthread_mutex_lock(&g_rte_lock);
+	err = g_upcie_rte.mem.heap_alive ? 0 : _rte_type1_complete_locked();
+	pthread_mutex_unlock(&g_rte_lock);
+
+	return err;
+}
+
 /**
  * Bring up the process-wide RTE in the given mode, or verify an already
  * initialized RTE matches. When opts->shm_id is non-zero, additionally

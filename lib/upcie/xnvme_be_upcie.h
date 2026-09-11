@@ -294,6 +294,18 @@ xnvme_be_upcie_gpu_map_open(struct xnvme_be_upcie_gpu_map *map, const char *bdf,
 void
 xnvme_be_upcie_gpu_map_close(struct xnvme_be_upcie_gpu_map *map);
 
+/**
+ * Finish the VFIO_TYPE1 bring-up, or join a finished one
+ *
+ * VFIO_SET_IOMMU needs a group already in the container, so this half of the
+ * RTE cannot run from _rte_init(); the controller that attaches first drives
+ * it. Safe to call from every controller and from several threads at once.
+ *
+ * @return 0 on success, negative errno on failure.
+ */
+int
+xnvme_be_upcie_type1_rte_complete(void);
+
 void
 xnvme_be_upcie_dev_close(struct xnvme_dev *dev);
 int

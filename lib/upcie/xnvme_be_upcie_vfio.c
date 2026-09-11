@@ -136,18 +136,15 @@ xnvme_be_upcie_mode_from_driver(const char *bdf, const char *driver_name,
 	return 0;
 }
 /**
- * Attach a controller's group to the RTE's type1 container, and on the
- * first controller also set_iommu(TYPE1) + MAP_DMA the hostmem hugepage
- * + init the shared dmamem_heap.
+ * Attach a controller's group to the RTE's type1 container, and on the first
+ * controller also drive the set_iommu + MAP_DMA half of the RTE bring-up.
  *
- * Rolls back the group open (and any RTE-side state it turned on) on
- * failure. The container itself and the hostmem hugepage remain owned
- * by the RTE.
+ * Rolls back the group open on failure. The container itself and the hostmem
+ * hugepage remain owned by the RTE.
  */
 int
 xnvme_be_upcie_type1_attach(struct xnvme_be_upcie_ctrlr *ctrlr, const char *bdf)
 {
-	int api_version = 0;
 	int group_id = -1;
 	int err;
 
@@ -183,55 +180,11 @@ xnvme_be_upcie_type1_attach(struct xnvme_be_upcie_ctrlr *ctrlr, const char *bdf)
 	}
 	ctrlr->attach.type1_group_attached = 1;
 
-	if (g_upcie_rte.type1.iommu_set) {
-		/* Container already set_iommu'd + mapped by an earlier controller. */
-		return 0;
-	}
-
-	err = vfio_get_api_version(&g_upcie_rte.type1.container, &api_version);
+	err = xnvme_be_upcie_type1_rte_complete();
 	if (err) {
-		XNVME_DEBUG("FAILED: vfio_get_api_version(); err(%d)", err);
+		XNVME_DEBUG("FAILED: xnvme_be_upcie_type1_rte_complete(); err(%d)", err);
 		goto fail_group;
 	}
-	if (api_version != VFIO_API_VERSION) {
-		XNVME_DEBUG("FAILED: unexpected VFIO_API_VERSION(%d != %d)", api_version,
-			    VFIO_API_VERSION);
-		err = -EINVAL;
-		goto fail_group;
-	}
-
-	if (!vfio_check_extension(&g_upcie_rte.type1.container, VFIO_TYPE1_IOMMU)) {
-		XNVME_DEBUG("FAILED: VFIO_TYPE1_IOMMU extension not supported");
-		err = -ENOTSUP;
-		goto fail_group;
-	}
-
-	err = vfio_set_iommu(&g_upcie_rte.type1.container, VFIO_TYPE1_IOMMU);
-	if (err < 0) {
-		XNVME_DEBUG("FAILED: vfio_set_iommu(TYPE1); errno(%d)", errno);
-		err = -errno;
-		goto fail_group;
-	}
-	g_upcie_rte.type1.iommu_set = 1;
-
-	/* MAP_DMA the whole hugepage at a caller-chosen base_iova; the
-	 * dmamem sits on that mapping as ARITHMETIC (base_iova + offset). */
-	err = dmamem_from_hostmem_type1(&g_upcie_rte.mem.dmem, &g_upcie_rte.type1.container,
-					(uint64_t)0, &g_upcie_rte.mem.hp);
-	if (err) {
-		XNVME_DEBUG("FAILED: dmamem_from_hostmem_type1(); err(%d)", err);
-		goto fail_group;
-	}
-	g_upcie_rte.mem.dmem_alive = 1;
-
-	err = dmamem_heap_init(&g_upcie_rte.mem.heap, &g_upcie_rte.mem.dmem, 4096);
-	if (err) {
-		XNVME_DEBUG("FAILED: dmamem_heap_init(); err(%d)", err);
-		dmamem_destroy(&g_upcie_rte.mem.dmem);
-		g_upcie_rte.mem.dmem_alive = 0;
-		goto fail_group;
-	}
-	g_upcie_rte.mem.heap_alive = 1;
 
 	return 0;
 
