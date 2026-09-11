@@ -17,6 +17,8 @@
  * @version 0.8.0
  */
 
+#include <pthread.h>
+
 struct dmamem_heap_block {
 	size_t offset;
 	size_t size;
@@ -28,6 +30,7 @@ struct dmamem_heap {
 	struct dmamem *dmem;                 ///< Not owned; caller owns lifetime
 	struct dmamem_heap_block *freelist;  ///< Head of the freelist (offset-ordered)
 	size_t alignment;                    ///< Default allocation alignment in bytes
+	pthread_mutex_t lock;                ///< Serializes freelist mutation across threads
 };
 
 static inline int
@@ -42,6 +45,8 @@ dmamem_heap_pp(struct dmamem_heap *heap)
 		return 0;
 	}
 
+	pthread_mutex_lock(&heap->lock);
+
 	wrtn += printf("\n");
 	wrtn += printf("  alignment: %zu\n", heap->alignment);
 	wrtn += printf("  freelist:\n");
@@ -49,6 +54,8 @@ dmamem_heap_pp(struct dmamem_heap *heap)
 		wrtn += printf("  - {offset: %zu, size: %zu, free: %d}\n", b->offset, b->size,
 			       b->free);
 	}
+
+	pthread_mutex_unlock(&heap->lock);
 
 	return wrtn;
 }
@@ -72,9 +79,11 @@ dmamem_heap_init(struct dmamem_heap *heap, struct dmamem *dmem, size_t alignment
 	memset(heap, 0, sizeof(*heap));
 	heap->dmem = dmem;
 	heap->alignment = alignment;
+	pthread_mutex_init(&heap->lock, NULL);
 
 	block = calloc(1, sizeof(*block));
 	if (!block) {
+		pthread_mutex_destroy(&heap->lock);
 		return -ENOMEM;
 	}
 	block->offset = 0;
@@ -89,6 +98,10 @@ dmamem_heap_init(struct dmamem_heap *heap, struct dmamem *dmem, size_t alignment
 
 /**
  * Release the freelist. The underlying dmamem is not touched.
+ *
+ * The caller must have quiesced the heap first. Holding the lock here would not
+ * make a concurrent alloc safe, since the destroy and the memset below pull the
+ * heap out from under whoever was waiting on it.
  */
 static inline void
 dmamem_heap_term(struct dmamem_heap *heap)
@@ -105,6 +118,8 @@ dmamem_heap_term(struct dmamem_heap *heap)
 		free(b);
 		b = next;
 	}
+
+	pthread_mutex_destroy(&heap->lock);
 
 	memset(heap, 0, sizeof(*heap));
 }
@@ -169,9 +184,10 @@ static inline int
 dmamem_heap_alloc_array_aligned(struct dmamem_heap *heap, size_t elem_count, size_t elem_size,
 				size_t alignment, size_t *offset_out)
 {
-	const size_t granule = dmamem_heap_granule(heap);
 	struct dmamem_heap_block *b, *tail;
+	size_t granule;
 	size_t size;
+	int err;
 
 	if (!heap || !elem_count || !elem_size || !alignment || !offset_out) {
 		return -EINVAL;
@@ -180,6 +196,9 @@ dmamem_heap_alloc_array_aligned(struct dmamem_heap *heap, size_t elem_count, siz
 		return -EINVAL;
 	}
 
+	pthread_mutex_lock(&heap->lock);
+
+	granule = dmamem_heap_granule(heap);
 	size = elem_count * elem_size;
 
 	/* Raising the alignment is what enforces the promise: on a grid the
@@ -192,7 +211,8 @@ dmamem_heap_alloc_array_aligned(struct dmamem_heap *heap, size_t elem_count, siz
 			UPCIE_DEBUG("FAILED: elem_size(%zu) exceeds granule(%zu); no contiguity "
 				    "beyond a granule can be promised",
 				    elem_size, granule);
-			return -EINVAL;
+			err = -EINVAL;
+			goto out;
 		} else if (!(granule % elem_size)) {
 			required = elem_size;
 		} else if (size <= granule) {
@@ -204,7 +224,8 @@ dmamem_heap_alloc_array_aligned(struct dmamem_heap *heap, size_t elem_count, siz
 			UPCIE_DEBUG("FAILED: elem_size(%zu) does not divide granule(%zu); an "
 				    "array spanning granules would tear",
 				    elem_size, granule);
-			return -EINVAL;
+			err = -EINVAL;
+			goto out;
 		}
 
 		if (required > alignment) {
@@ -232,7 +253,8 @@ dmamem_heap_alloc_array_aligned(struct dmamem_heap *heap, size_t elem_count, siz
 		if (front_gap) {
 			struct dmamem_heap_block *fg = calloc(1, sizeof(*fg));
 			if (!fg) {
-				return -ENOMEM;
+				err = -ENOMEM;
+				goto out;
 			}
 			fg->offset = b->offset;
 			fg->size = front_gap;
@@ -256,7 +278,8 @@ dmamem_heap_alloc_array_aligned(struct dmamem_heap *heap, size_t elem_count, siz
 		if (remaining) {
 			tail = calloc(1, sizeof(*tail));
 			if (!tail) {
-				return -ENOMEM;
+				err = -ENOMEM;
+				goto out;
 			}
 			tail->offset = b->offset + size;
 			tail->size = remaining;
@@ -271,10 +294,16 @@ dmamem_heap_alloc_array_aligned(struct dmamem_heap *heap, size_t elem_count, siz
 
 		assert(!dmamem_heap_layout_tears(*offset_out, elem_count, elem_size, granule));
 
-		return 0;
+		err = 0;
+		goto out;
 	}
 
-	return -ENOMEM;
+	err = -ENOMEM;
+
+out:
+	pthread_mutex_unlock(&heap->lock);
+
+	return err;
 }
 
 /**
@@ -342,6 +371,8 @@ dmamem_heap_free(struct dmamem_heap *heap, size_t offset)
 		return;
 	}
 
+	pthread_mutex_lock(&heap->lock);
+
 	for (b = heap->freelist; b; prev = b, b = b->next) {
 		if (b->offset == offset) {
 			break;
@@ -349,6 +380,7 @@ dmamem_heap_free(struct dmamem_heap *heap, size_t offset)
 	}
 	if (!b) {
 		UPCIE_DEBUG("FAILED: no block at offset(%zu)", offset);
+		pthread_mutex_unlock(&heap->lock);
 		return;
 	}
 
@@ -368,6 +400,8 @@ dmamem_heap_free(struct dmamem_heap *heap, size_t offset)
 		prev->next = b->next;
 		free(b);
 	}
+
+	pthread_mutex_unlock(&heap->lock);
 }
 
 /**
