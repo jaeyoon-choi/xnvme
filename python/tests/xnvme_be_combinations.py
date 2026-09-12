@@ -127,6 +127,14 @@ def get_combinations():
         },
         # User-space NVMe-driver
         {
+            "be": ["upcie"],
+            "mem": ["upcie"],
+            "async": ["upcie"],
+            "sync": ["upcie"],
+            "admin": ["upcie"],
+            "label": ["pcie"],
+        },
+        {
             "be": ["libvfn"],
             "mem": ["libvfn"],
             "async": ["libvfn"],

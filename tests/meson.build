@@ -17,6 +17,10 @@ tests = {
     ['alloc', ['buf_alloc_free', '1GB', '--count', '31']],
     ['virt_alloc', ['buf_virt_alloc_free', '1GB', '--count', '31']],
   ],
+  'threaded.c': [
+    ['4 threads', ['buf_alloc_free_mt', '1GB', '--count', '4']],
+    ['16 threads', ['buf_alloc_free_mt', '1GB', '--count', '16']],
+  ],
   'cli.c': [
     ['optional', ['optional']],
     ['numeric', ['numeric', '--nqueues', '4', '--dev-id', '7', '--max-io-bytes', '131072']],
